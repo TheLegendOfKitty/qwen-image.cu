@@ -4,6 +4,71 @@
 #include "cuda_kernels.cuh"
 #include <string>
 #include <vector>
+#include <cstdio>
+
+// Calibration file writer for GPTQ quantization.
+// Captures Hadamard-rotated input activations during inference.
+// File format: "GPTQ" magic (4B), version=1 (4B), num_entries (4B),
+//   then per entry: name_len(4B), name(chars), M(4B), K(4B), had_block_size(4B), data(BF16[M*K])
+struct CalibrationWriter {
+    FILE* f = nullptr;
+    uint32_t num_entries = 0;
+    long count_offset = 0; // file offset of num_entries field
+
+    bool open(const char* path) {
+        f = fopen(path, "wb");
+        if (!f) return false;
+        // Write header
+        uint32_t magic = 0x51545047; // "GPTQ" little-endian
+        uint32_t version = 1;
+        fwrite(&magic, 4, 1, f);
+        fwrite(&version, 4, 1, f);
+        count_offset = ftell(f);
+        fwrite(&num_entries, 4, 1, f); // placeholder
+        return true;
+    }
+
+    // Write a calibration entry. fp32_data is GPU memory [M, K].
+    // Applies FWHT in-place, converts to BF16, writes to file.
+    void write_entry(const std::string& name, float* fp32_data_gpu, int M, int K, int had_block_size) {
+        // Apply Hadamard rotation in-place
+        if (had_block_size > 1) {
+            fwht_inplace(fp32_data_gpu, M, K, had_block_size);
+        }
+        // Convert FP32 → BF16 on GPU
+        int64_t n = (int64_t)M * K;
+        __nv_bfloat16* bf16_gpu;
+        CUDA_CHECK(cudaMalloc(&bf16_gpu, n * sizeof(__nv_bfloat16)));
+        fp32_to_bf16(fp32_data_gpu, bf16_gpu, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Download to CPU
+        std::vector<__nv_bfloat16> buf(n);
+        CUDA_CHECK(cudaMemcpy(buf.data(), bf16_gpu, n * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(bf16_gpu));
+
+        // Write entry
+        uint32_t name_len = (uint32_t)name.size();
+        uint32_t m = (uint32_t)M, k = (uint32_t)K, hbs = (uint32_t)had_block_size;
+        fwrite(&name_len, 4, 1, f);
+        fwrite(name.data(), 1, name_len, f);
+        fwrite(&m, 4, 1, f);
+        fwrite(&k, 4, 1, f);
+        fwrite(&hbs, 4, 1, f);
+        fwrite(buf.data(), sizeof(__nv_bfloat16), n, f);
+
+        num_entries++;
+    }
+
+    void close() {
+        if (!f) return;
+        // Patch num_entries in header
+        fseek(f, count_offset, SEEK_SET);
+        fwrite(&num_entries, 4, 1, f);
+        fclose(f);
+        f = nullptr;
+    }
+};
 
 struct TransformerWeights {
     // Timestep embedding (INT8 quantized)
@@ -235,9 +300,11 @@ struct TransformerWeights {
 
 // Forward pass: x: [1, C, H, W], timestep: scalar, context: [1, seq, 3584], pe: [pos, 64, 2, 2]
 // Returns: [1, out_channels, H, W]
+// If cal is non-null, captures Hadamard-rotated input activations for GPTQ calibration.
 Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& x,       // [1, 64, H, W] after patchify input
                            float timestep,
                            const Tensor& context,  // [1, seq_len, 3584]
                            const Tensor& pe,       // [pos_len, 64, 2, 2] FP32
-                           int H, int W);          // original latent H, W
+                           int H, int W,           // original latent H, W
+                           CalibrationWriter* cal = nullptr);

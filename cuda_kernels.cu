@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <curand_kernel.h>
+#include <cusolverDn.h>
 #include <cmath>
 #include <cstdio>
 #include <cfloat>
@@ -2952,6 +2953,504 @@ QuantizedWeight quantize_weight_tensor_int4(const Tensor& bf16_weight, int rank,
     L_down_gpu.free_data();
 
     // 9. Package
+    QuantizedWeight qw;
+    qw.mode = QuantMode::INT4_SVD;
+    qw.qweight = std::move(qw_data);
+    qw.scales4 = std::move(qw_scales);
+    qw.svd_up = std::move(svd_up_bf16);
+    qw.svd_down = std::move(svd_down_bf16);
+    qw.group_size = gs;
+    qw.svd_rank = r;
+    qw.had_block_size = hbs;
+    return qw;
+}
+
+// ================================================================
+// GPTQ CALIBRATION READER
+// ================================================================
+
+bool CalibrationReader::load(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    uint32_t magic, version, num;
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x51545047) {
+        fprintf(stderr, "CalibrationReader: bad magic\n");
+        fclose(f); return false;
+    }
+    if (fread(&version, 4, 1, f) != 1 || version != 1) {
+        fprintf(stderr, "CalibrationReader: unsupported version %u\n", version);
+        fclose(f); return false;
+    }
+    if (fread(&num, 4, 1, f) != 1) { fclose(f); return false; }
+
+    entries.resize(num);
+    for (uint32_t i = 0; i < num; i++) {
+        uint32_t name_len;
+        if (fread(&name_len, 4, 1, f) != 1) { fclose(f); return false; }
+        entries[i].name.resize(name_len);
+        if (fread(&entries[i].name[0], 1, name_len, f) != name_len) { fclose(f); return false; }
+
+        uint32_t m, k, hbs;
+        if (fread(&m, 4, 1, f) != 1) { fclose(f); return false; }
+        if (fread(&k, 4, 1, f) != 1) { fclose(f); return false; }
+        if (fread(&hbs, 4, 1, f) != 1) { fclose(f); return false; }
+        entries[i].M = (int)m;
+        entries[i].K = (int)k;
+        entries[i].had_block_size = (int)hbs;
+
+        int64_t n = (int64_t)m * k;
+        entries[i].data.resize(n);
+        if (fread(entries[i].data.data(), sizeof(__nv_bfloat16), n, f) != (size_t)n) {
+            fclose(f); return false;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "CalibrationReader: loaded %u entries from %s\n", num, path);
+    return true;
+}
+
+float* CalibrationReader::get_activation_gpu(const std::string& name, int& out_M, int& out_K) const {
+    // Collect all matching entries
+    std::vector<const Entry*> matches;
+    for (auto& e : entries) {
+        if (e.name == name) matches.push_back(&e);
+    }
+    if (matches.empty()) { out_M = 0; out_K = 0; return nullptr; }
+
+    int K = matches[0]->K;
+    int total_M = 0;
+    for (auto* e : matches) {
+        assert(e->K == K);
+        total_M += e->M;
+    }
+
+    // Concatenate BF16 on CPU, convert to FP32
+    std::vector<float> fp32((int64_t)total_M * K);
+    int64_t offset = 0;
+    for (auto* e : matches) {
+        int64_t n = (int64_t)e->M * K;
+        for (int64_t j = 0; j < n; j++)
+            fp32[offset + j] = __bfloat162float(e->data[j]);
+        offset += n;
+    }
+
+    // Upload to GPU
+    float* gpu;
+    CUDA_CHECK(cudaMalloc(&gpu, (int64_t)total_M * K * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(gpu, fp32.data(), (int64_t)total_M * K * sizeof(float), cudaMemcpyHostToDevice));
+
+    out_M = total_M;
+    out_K = K;
+    return gpu;
+}
+
+// ================================================================
+// GPTQ NF4 QUANTIZATION
+// ================================================================
+
+// Host-side NF4 grid (same as device __constant__)
+static const float NF4_GRID_HOST[16] = {
+    -1.0f, -0.6962f, -0.5251f, -0.3949f, -0.2844f, -0.1848f, -0.0911f, 0.0f,
+     0.0796f,  0.1609f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f, 1.0f
+};
+
+// GPTQ block kernel: process one group of columns (group_size) with error feedback.
+// One thread per row of R. Sequentially processes group_size columns.
+// R: [N, K] residual matrix (row-major) — modified in place
+// H_inv: [K, K] inverse Hessian (row-major)
+// qweight: [N, K/2] packed NF4 output
+// scales: [N, num_groups] per-group scales
+// block_start: first column of this block
+// gs: group_size
+// E_out: [N, gs] error matrix output for cross-block update
+__global__ void gptq_nf4_block_kernel(
+    float* __restrict__ R,
+    const float* __restrict__ H_inv,
+    uint8_t* __restrict__ qweight,
+    float* __restrict__ scales,
+    float* __restrict__ E_out,
+    int N, int K, int block_start, int gs)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+
+    int num_groups = K / gs;
+    int group_idx = block_start / gs;
+
+    // Compute per-group scale: max(|R[row, block_start:block_start+gs]|)
+    float max_abs = 0.0f;
+    for (int j = 0; j < gs; j++) {
+        float v = fabsf(R[(int64_t)row * K + block_start + j]);
+        if (v > max_abs) max_abs = v;
+    }
+    float scale = max_abs;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+    scales[(int64_t)row * num_groups + group_idx] = scale;
+
+    // Process columns sequentially with error feedback
+    for (int j = 0; j < gs; j++) {
+        int col = block_start + j;
+        float w = R[(int64_t)row * K + col];
+        float normalized = w * inv_scale;
+
+        // Find nearest NF4 grid point
+        int best_q = 0;
+        float best_dist = 1e9f;
+        for (int q = 0; q < 16; q++) {
+            float d = fabsf(normalized - NF4_GRID[q]);
+            if (d < best_dist) { best_dist = d; best_q = q; }
+        }
+
+        // Dequantized value
+        float w_hat = NF4_GRID[best_q] * scale;
+        float error = w - w_hat;
+
+        // Pack quantized value
+        int byte_idx = col / 2;
+        if (col % 2 == 0) {
+            qweight[(int64_t)row * (K / 2) + byte_idx] =
+                (qweight[(int64_t)row * (K / 2) + byte_idx] & 0xF0) | (uint8_t)best_q;
+        } else {
+            qweight[(int64_t)row * (K / 2) + byte_idx] =
+                (qweight[(int64_t)row * (K / 2) + byte_idx] & 0x0F) | ((uint8_t)best_q << 4);
+        }
+
+        // GPTQ error propagation: E_j = error / H_inv[j,j]
+        float h_jj = H_inv[(int64_t)col * K + col];
+        float err_scale = (h_jj > 1e-12f) ? (error / h_jj) : 0.0f;
+
+        // Store scaled error for cross-block GEMM update
+        E_out[(int64_t)row * gs + j] = err_scale;
+
+        // Propagate within block: R[:, k] -= E_j * H_inv[j, k]
+        for (int k = j + 1; k < gs; k++) {
+            int col_k = block_start + k;
+            R[(int64_t)row * K + col_k] -= err_scale * H_inv[(int64_t)col * K + col_k];
+        }
+    }
+}
+
+// Host function: GPTQ quantize the Hadamard-rotated residual R using calibration data.
+// R: [N, K] FP32 on GPU (modified in place — consumed)
+// x_rot: [M_total, K] FP32 on GPU (Hadamard-rotated calibration activations)
+// Returns packed qweight [N, K/2] and scales [N, K/gs] via output tensors.
+static void gptq_quantize_nf4(
+    float* R_gpu, int N, int K, int group_size,
+    const float* x_rot_gpu, int M_total,
+    Tensor& out_qweight, Tensor& out_scales)
+{
+    int gs = group_size;
+    int num_groups = K / gs;
+    assert(K % gs == 0);
+    assert(K % 2 == 0);
+
+    // 1. Compute Hessian H = X_rot^T × X_rot [K, K] via cuBLAS SGEMM
+    float* H_gpu;
+    CUDA_CHECK(cudaMalloc(&H_gpu, (int64_t)K * K * sizeof(float)));
+    {
+        float alpha = 1.0f, beta = 0.0f;
+        // H_col[K,K] = X_col^T[K,M] × X_col[M,K]
+        // X row-major [M,K] = X col-major [K,M] lda=K
+        // So: C[K,K] = OP_T(X_col)[K,M] × OP_N(X_col)[M,K]... no:
+        // X_col has lda=K, shape [K,M]. X_col^T = [M,K].
+        // H = X^T X in row-major = X_col X_col^T in col-major
+        // cublasSgemm(N, T, K, K, M, ..., X, K, X, K, ..., H, K)
+        CUBLAS_CHECK(cublasSgemm(cublas(), CUBLAS_OP_N, CUBLAS_OP_T,
+            K, K, M_total, &alpha,
+            x_rot_gpu, K, x_rot_gpu, K,
+            &beta, H_gpu, K));
+    }
+
+    // 2. Dampen diagonal: H[i,i] += 0.01 * mean(diag(H))
+    //    Additive damping ensures rank-deficient directions get meaningful regularization.
+    {
+        std::vector<float> H_host((int64_t)K * K);
+        CUDA_CHECK(cudaMemcpy(H_host.data(), H_gpu, (int64_t)K * K * sizeof(float), cudaMemcpyDeviceToHost));
+        double diag_mean = 0.0;
+        for (int i = 0; i < K; i++)
+            diag_mean += H_host[(int64_t)i * K + i];
+        diag_mean /= K;
+        float damp = (float)(0.01 * diag_mean);
+        for (int i = 0; i < K; i++)
+            H_host[(int64_t)i * K + i] += damp;
+        CUDA_CHECK(cudaMemcpy(H_gpu, H_host.data(), (int64_t)K * K * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    // 3. Cholesky factorization + inversion via cuSOLVER
+    cusolverDnHandle_t solver;
+    cusolverDnCreate(&solver);
+    {
+        int ws_potrf = 0, ws_potri = 0;
+        cusolverDnSpotrf_bufferSize(solver, CUBLAS_FILL_MODE_UPPER, K, H_gpu, K, &ws_potrf);
+        cusolverDnSpotri_bufferSize(solver, CUBLAS_FILL_MODE_UPPER, K, H_gpu, K, &ws_potri);
+        int workspace_size = std::max(ws_potrf, ws_potri);
+        float* d_work;
+        CUDA_CHECK(cudaMalloc(&d_work, (int64_t)workspace_size * sizeof(float)));
+        int* d_info;
+        CUDA_CHECK(cudaMalloc(&d_info, sizeof(int)));
+
+        // Cholesky: H = L L^T (upper triangular)
+        cusolverDnSpotrf(solver, CUBLAS_FILL_MODE_UPPER, K, H_gpu, K, d_work, workspace_size, d_info);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        int h_info;
+        CUDA_CHECK(cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
+        if (h_info != 0) {
+            fprintf(stderr, "GPTQ: Cholesky failed (info=%d), falling back to damped identity\n", h_info);
+            // Fall back: set H_inv = identity (no error redistribution)
+            std::vector<float> identity((int64_t)K * K, 0.0f);
+            for (int i = 0; i < K; i++) identity[(int64_t)i * K + i] = 1.0f;
+            CUDA_CHECK(cudaMemcpy(H_gpu, identity.data(), (int64_t)K * K * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            // Invert from Cholesky
+            cusolverDnSpotri(solver, CUBLAS_FILL_MODE_UPPER, K, H_gpu, K, d_work, workspace_size, d_info);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
+            if (h_info != 0) {
+                fprintf(stderr, "GPTQ: Cholesky inverse failed (info=%d)\n", h_info);
+            }
+
+            // Symmetrize: cuSOLVER only fills upper triangle (col-major: row <= col)
+            // Upper triangle element (row=i, col=j) at index j*K+i where j >= i
+            // Copy upper → lower: H(j,i) = H(i,j)
+            std::vector<float> H_host((int64_t)K * K);
+            CUDA_CHECK(cudaMemcpy(H_host.data(), H_gpu, (int64_t)K * K * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < K; i++)
+                for (int j = i + 1; j < K; j++)
+                    H_host[(int64_t)i * K + j] = H_host[(int64_t)j * K + i];
+            CUDA_CHECK(cudaMemcpy(H_gpu, H_host.data(), (int64_t)K * K * sizeof(float), cudaMemcpyHostToDevice));
+        }
+
+        CUDA_CHECK(cudaFree(d_work));
+        CUDA_CHECK(cudaFree(d_info));
+    }
+    cusolverDnDestroy(solver);
+
+    // H_gpu now contains H^{-1} [K, K]
+
+    // 4. Allocate output tensors
+    out_qweight = Tensor::alloc({(int64_t)N, (int64_t)(K / 2)}, DType::UINT8);
+    out_qweight.zero();
+    out_scales = Tensor::alloc({(int64_t)N, (int64_t)num_groups}, DType::FP32);
+
+    // Error buffer for cross-block update
+    float* E_gpu;
+    CUDA_CHECK(cudaMalloc(&E_gpu, (int64_t)N * gs * sizeof(float)));
+
+    // 5. Process column blocks
+    for (int block_start = 0; block_start < K; block_start += gs) {
+        int current_gs = std::min(gs, K - block_start);
+
+        // Launch GPTQ block kernel: one thread per row
+        int threads = 256;
+        int blocks = (N + threads - 1) / threads;
+        gptq_nf4_block_kernel<<<blocks, threads>>>(
+            R_gpu, H_gpu,
+            (uint8_t*)out_qweight.data, (float*)out_scales.data,
+            E_gpu,
+            N, K, block_start, current_gs);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Cross-block update: R[:, remaining] -= E × H_inv[block, remaining]
+        int remaining = K - (block_start + current_gs);
+        if (remaining > 0) {
+            // E: [N, gs] row-major
+            // H_inv_sub: [gs, remaining] starting at H_inv[block_start, block_start+gs]
+            // R_sub: [N, remaining] starting at R[:, block_start+gs]
+            float alpha = -1.0f, beta = 1.0f;
+            // In col-major: E_col [gs, N] lda=gs, H_sub_col [remaining, gs] lda=K
+            // C_col [remaining, N] lda=K
+            // We need: R_sub -= E × H_sub
+            // Col-major: C[remaining,N] = H_sub^T[remaining,gs] × E_col[gs,N]... not quite.
+            // R row-major [N, K]: R_sub at offset (block_start+gs) with stride K
+            // E row-major [N, gs]: col-major [gs, N] lda=gs
+            // H_inv row-major [K, K]: H_sub at row=block_start, col=block_start+gs, shape [gs, remaining]
+            //   col-major: [remaining, gs] lda=K (starting at H_inv + block_start*K + block_start+gs)
+            // Result: R_sub col-major [K-..., N] lda=K at R_gpu + block_start + gs
+            //
+            // R_sub[N, remaining] -= E[N, gs] @ H_sub[gs, remaining]
+            // Col-major: R_sub_col[remaining, N] -= H_sub_col^T[remaining, gs] @ E_col[gs, N]
+            // But H_sub col-major is [remaining, gs] lda=K. Its transpose is [gs, remaining].
+            // cublasSgemm(T, N, remaining, N, gs, -1, H_sub, K, E, gs, 1, R_sub, K)
+            // R_rm[N, remaining] -= E_rm[N, gs] @ Hblock_rm[gs, remaining]
+            // Col-major: R_cm[remaining, N] -= Hblock_cm[remaining, gs] @ E_cm[gs, N]
+            CUBLAS_CHECK(cublasSgemm(cublas(),
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                remaining, N, current_gs,
+                &alpha,
+                H_gpu + (int64_t)block_start * K + (block_start + current_gs), K,
+                E_gpu, current_gs,
+                &beta,
+                R_gpu + (block_start + current_gs), K));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+
+    CUDA_CHECK(cudaFree(E_gpu));
+    CUDA_CHECK(cudaFree(H_gpu));
+}
+
+// GPTQ-guided INT4+SVD quantization
+QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int rank, int group_size,
+                                                   const float* x_rot_gpu, int M_total, int x_K) {
+    assert(bf16_weight.dtype == DType::BF16);
+    assert(bf16_weight.ndim == 2);
+
+    int N = (int)bf16_weight.shape[0];
+    int K = (int)bf16_weight.shape[1];
+
+    // Adjust group_size for small K
+    int gs = std::min(group_size, K);
+    while (K % gs != 0 && gs > 2) gs /= 2;
+    assert(K % gs == 0);
+    assert(K % 2 == 0);
+
+    // Clamp rank
+    int r = std::min(rank, std::min(N, K) - 1);
+    int p = 10;
+    int rp = r + p;
+    if (rp > std::min(N, K)) rp = std::min(N, K);
+    if (r > rp) r = rp;
+
+    // Convert BF16 -> FP32
+    Tensor fp32_w = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+    bf16_to_fp32((__nv_bfloat16*)bf16_weight.data, (float*)fp32_w.data, (int64_t)N * K);
+
+    // === Randomized SVD (same as quantize_weight_tensor_int4) ===
+    float alpha_f = 1.0f, beta_f = 0.0f, neg_one = -1.0f, one = 1.0f;
+
+    // 1. Random Omega
+    std::vector<float> omega_host((int64_t)K * rp);
+    srand(42);
+    for (auto& v : omega_host) v = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    Tensor omega = Tensor::alloc({(int64_t)K, (int64_t)rp}, DType::FP32);
+    omega.from_host(omega_host.data());
+
+    // 2. Y = W @ Omega
+    Tensor Y = Tensor::alloc({(int64_t)N, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, rp, N, K, &alpha_f,
+        omega.data, CUDA_R_32F, rp, fp32_w.data, CUDA_R_32F, K, &beta_f,
+        Y.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    omega.free_data();
+
+    // 3. Modified Gram-Schmidt QR
+    {
+        float* Q_data = (float*)Y.data;
+        Tensor dots_buf = Tensor::alloc({(int64_t)rp}, DType::FP32);
+        float zero_f = 0.0f, neg_one_f = -1.0f, one_f = 1.0f;
+        for (int j = 0; j < rp; j++) {
+            float norm_sq;
+            CUBLAS_CHECK(cublasSdot(cublas(), N, Q_data + j, rp, Q_data + j, rp, &norm_sq));
+            float inv_norm = (norm_sq > 1e-24f) ? (1.0f / sqrtf(norm_sq)) : 0.0f;
+            CUBLAS_CHECK(cublasSscal(cublas(), N, &inv_norm, Q_data + j, rp));
+            if (j + 1 < rp) {
+                int rem = rp - j - 1;
+                CUBLAS_CHECK(cublasSgemv(cublas(), CUBLAS_OP_N,
+                    rem, N, &one_f, Q_data + (j + 1), rp, Q_data + j, rp,
+                    &zero_f, (float*)dots_buf.data, 1));
+                CUBLAS_CHECK(cublasSger(cublas(), rem, N, &neg_one_f,
+                    (float*)dots_buf.data, 1, Q_data + j, rp, Q_data + (j + 1), rp));
+            }
+        }
+        dots_buf.free_data();
+    }
+
+    // 4. B = Q^T @ W
+    Tensor B = Tensor::alloc({(int64_t)rp, (int64_t)K}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, K, rp, N, &alpha_f,
+        fp32_w.data, CUDA_R_32F, K, Y.data, CUDA_R_32F, rp, &beta_f,
+        B.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+    // 5. C = B @ B^T
+    Tensor C_gpu = Tensor::alloc({(int64_t)rp, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, rp, rp, K, &alpha_f,
+        B.data, CUDA_R_32F, K, B.data, CUDA_R_32F, K, &beta_f,
+        C_gpu.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> C_host(rp * rp);
+    C_gpu.to_host(C_host.data());
+    C_gpu.free_data();
+
+    // CPU Jacobi eigendecomposition
+    std::vector<float> D(rp);
+    cpu_jacobi_eig(C_host.data(), D.data(), rp);
+
+    std::vector<float> sigma(r);
+    for (int i = 0; i < r; i++)
+        sigma[i] = (D[i] > 0) ? sqrtf(D[i]) : 0.0f;
+
+    std::vector<float> U_inv_sigma(rp * r);
+    std::vector<float> U_sigma(rp * r);
+    for (int j = 0; j < r; j++) {
+        float s = sigma[j];
+        float inv_s = (s > 1e-12f) ? (1.0f / s) : 0.0f;
+        for (int m = 0; m < rp; m++) {
+            U_inv_sigma[m * r + j] = C_host[m * rp + j] * inv_s;
+            U_sigma[m * r + j] = C_host[m * rp + j] * s;
+        }
+    }
+
+    Tensor U_inv_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    Tensor U_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    U_inv_sigma_gpu.from_host(U_inv_sigma.data());
+    U_sigma_gpu.from_host(U_sigma.data());
+
+    // 6. L_down [K, r]
+    Tensor L_down_gpu = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, r, K, rp, &alpha_f,
+        U_inv_sigma_gpu.data, CUDA_R_32F, r, B.data, CUDA_R_32F, K, &beta_f,
+        L_down_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_inv_sigma_gpu.free_data();
+    B.free_data();
+
+    // 7. L_up [N, r]
+    Tensor L_up_gpu = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, r, N, rp, &alpha_f,
+        U_sigma_gpu.data, CUDA_R_32F, r, Y.data, CUDA_R_32F, rp, &beta_f,
+        L_up_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_sigma_gpu.free_data();
+    Y.free_data();
+
+    // 8. Residual R = W - L_up @ L_down^T
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, K, N, r, &neg_one,
+        L_down_gpu.data, CUDA_R_32F, r, L_up_gpu.data, CUDA_R_32F, r, &one,
+        fp32_w.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 9. Hadamard rotation of residual
+    int hbs = hadamard_block_size(K);
+    if (hbs > 1) {
+        fwht_inplace((float*)fp32_w.data, N, K, hbs);
+    }
+
+    // 10. GPTQ quantization of Hadamard-rotated residual
+    // x_rot_gpu [M_total, K] already has the correct K (Hadamard-rotated calibration)
+    assert(x_K == K);
+
+    Tensor qw_data, qw_scales;
+    gptq_quantize_nf4((float*)fp32_w.data, N, K, gs,
+                       x_rot_gpu, M_total,
+                       qw_data, qw_scales);
+    fp32_w.free_data();
+
+    // 11. Convert L_up, L_down to BF16
+    Tensor svd_up_bf16 = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::BF16);
+    Tensor svd_down_bf16 = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::BF16);
+    fp32_to_bf16((float*)L_up_gpu.data, (__nv_bfloat16*)svd_up_bf16.data, (int64_t)N * r);
+    fp32_to_bf16((float*)L_down_gpu.data, (__nv_bfloat16*)svd_down_bf16.data, (int64_t)K * r);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    L_up_gpu.free_data();
+    L_down_gpu.free_data();
+
+    // 12. Package
     QuantizedWeight qw;
     qw.mode = QuantMode::INT4_SVD;
     qw.qweight = std::move(qw_data);

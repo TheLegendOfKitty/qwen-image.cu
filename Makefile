@@ -8,10 +8,10 @@ SRCS = main.cu cuda_kernels.cu text_encoder.cu transformer.cu vae_decoder.cu
 TARGET = qwen-image
 
 $(TARGET): $(SRCS) $(wildcard *.h *.cuh)
-	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) $(SRCS) -o $@ $(LIBS)
+	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) $(SRCS) -o $@ $(LIBS) -lcusolver
 
 quantize: quantize.cu cuda_kernels.cu $(wildcard *.h *.cuh)
-	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) quantize.cu cuda_kernels.cu -o $@ $(LIBS)
+	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) quantize.cu cuda_kernels.cu -o $@ $(LIBS) -lcusolver
 
 clean:
 	rm -f $(TARGET) quantize

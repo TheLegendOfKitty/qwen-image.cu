@@ -294,6 +294,32 @@ void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& wei
 // Quantize a BF16 weight to INT4+SVD (offline tool)
 QuantizedWeight quantize_weight_tensor_int4(const Tensor& bf16_weight, int rank, int group_size);
 
+// GPTQ-guided INT4+SVD quantization (offline tool)
+// Same as above but uses calibration activations to minimize reconstruction error.
+// x_rot: Hadamard-rotated calibration activations [M_total, K] in FP32 (GPU)
+QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int rank, int group_size,
+                                                   const float* x_rot_gpu, int M_total, int K);
+
+// ================================================================
+// GPTQ CALIBRATION DATA READER
+// ================================================================
+
+struct CalibrationReader {
+    struct Entry {
+        std::string name;
+        int M, K, had_block_size;
+        std::vector<__nv_bfloat16> data; // BF16 on CPU
+    };
+    std::vector<Entry> entries;
+
+    bool load(const char* path);
+
+    // Collect all entries with the given name prefix, concatenate and convert to FP32 on GPU.
+    // Returns nullptr if no entries found, caller must cudaFree.
+    // Sets out_M to total M (sum of all matching entries).
+    float* get_activation_gpu(const std::string& name, int& out_M, int& out_K) const;
+};
+
 // Scratch bytes for INT4 forward
 inline int64_t int4_scratch_bytes(int M, int K, int N, int svd_rank) {
     int64_t deq_weight = (((int64_t)N * K * 2 + 255) & ~255LL);  // BF16 dequant weight [N,K]

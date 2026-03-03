@@ -84,7 +84,8 @@ Tensor transformer_forward(const TransformerWeights& w,
                            float timestep_val,
                            const Tensor& context,
                            const Tensor& pe,
-                           int H, int W) {
+                           int H, int W,
+                           CalibrationWriter* cal) {
     const int inner_dim = 3072; // 24 * 128
     const int n_heads = 24;
     const int head_dim = 128;
@@ -361,6 +362,19 @@ Tensor transformer_forward(const TransformerWeights& w,
                       txt_mods + 1 * inner_dim,
                       (float*)txt_normed_fp32.data, n_txt, inner_dim);
 
+        // Calibration: capture img_normed_fp32 for to_q/to_k/to_v (shared input)
+        if (cal) {
+            std::string prefix = "blocks." + std::to_string(bi) + ".img_attn_qkv";
+            // Copy FP32 data (write_entry applies FWHT in-place)
+            float* cal_buf;
+            CUDA_CHECK(cudaMalloc(&cal_buf, (int64_t)n_img * inner_dim * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(cal_buf, img_normed_fp32.data,
+                                  (int64_t)n_img * inner_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+            int hbs = hadamard_block_size(inner_dim);
+            cal->write_entry(prefix, cal_buf, n_img, inner_dim, hbs);
+            CUDA_CHECK(cudaFree(cal_buf));
+        }
+
         // Attention projections: FP32 activations → INT8 GEMM → FP32 output.
         {
             Tensor oq = img_q.view({n_img, inner_dim});
@@ -465,6 +479,18 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("attn_out_txt.bin", txt_attn_out.data, (int64_t)n_txt * inner_dim, false);
         }
 
+        // Calibration: capture img_attn_out for to_out
+        if (cal) {
+            std::string prefix = "blocks." + std::to_string(bi) + ".img_attn_out";
+            float* cal_buf;
+            CUDA_CHECK(cudaMalloc(&cal_buf, (int64_t)n_img * inner_dim * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(cal_buf, img_attn_out.data,
+                                  (int64_t)n_img * inner_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+            int hbs = hadamard_block_size(inner_dim);
+            cal->write_entry(prefix, cal_buf, n_img, inner_dim, hbs);
+            CUDA_CHECK(cudaFree(cal_buf));
+        }
+
         // Output projections: FP32 activations → INT8 GEMM → FP32 output.
         {
             Tensor ip_2d = img_proj.view({n_img, inner_dim});
@@ -505,6 +531,18 @@ Tensor transformer_forward(const TransformerWeights& w,
                       txt_mods + 4 * inner_dim,
                       (float*)txt_normed_fp32.data, n_txt, inner_dim);
 
+        // Calibration: capture img_normed_fp32 for img_mlp_fc1
+        if (cal) {
+            std::string prefix = "blocks." + std::to_string(bi) + ".img_mlp_in";
+            float* cal_buf;
+            CUDA_CHECK(cudaMalloc(&cal_buf, (int64_t)n_img * inner_dim * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(cal_buf, img_normed_fp32.data,
+                                  (int64_t)n_img * inner_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+            int hbs = hadamard_block_size(inner_dim);
+            cal->write_entry(prefix, cal_buf, n_img, inner_dim, hbs);
+            CUDA_CHECK(cudaFree(cal_buf));
+        }
+
         // GELU MLP (INT8 GEMMs)
         if (dump_internal_block) dump_internal("img_mlp_input.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
         {
@@ -515,6 +553,17 @@ Tensor transformer_forward(const TransformerWeights& w,
             gelu_fp32((float*)img_mlp_fp32.data, (float*)img_mlp_fp32.data,
                       (int64_t)n_img * mlp_dim);
             if (dump_internal_block) dump_internal("img_mlp_gelu.bin", img_mlp_fp32.data, (int64_t)n_img * mlp_dim, false);
+            // Calibration: capture img_mlp_fp32 (post-GELU) for img_mlp_fc2
+            if (cal) {
+                std::string prefix = "blocks." + std::to_string(bi) + ".img_mlp_mid";
+                float* cal_buf;
+                CUDA_CHECK(cudaMalloc(&cal_buf, (int64_t)n_img * mlp_dim * sizeof(float)));
+                CUDA_CHECK(cudaMemcpy(cal_buf, img_mlp_fp32.data,
+                                      (int64_t)n_img * mlp_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+                int hbs = hadamard_block_size(mlp_dim);
+                cal->write_entry(prefix, cal_buf, n_img, mlp_dim, hbs);
+                CUDA_CHECK(cudaFree(cal_buf));
+            }
             Tensor out_2d = img_mlp_out.view({n_img, inner_dim});
             linear_forward_quantized(img_mlp_fp32, b.img_mlp_fc2_weight, &b.img_mlp_fc2_bias, out_2d, gemm_scratch);
             if (dump_internal_block) dump_internal("img_mlp_out.bin", img_mlp_out.data, (int64_t)n_img * inner_dim, false);

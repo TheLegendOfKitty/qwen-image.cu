@@ -22,6 +22,7 @@ struct Config {
     std::string model_dir = "./Qwen-Image-2512/";
     std::string quant_transformer; // optional: pre-quantized transformer safetensors file
     std::string output = "output.ppm";
+    std::string calibrate; // optional: output calibration file for GPTQ
     int width = 512;
     int height = 512;
     int steps = 20;
@@ -42,6 +43,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.model_dir = argv[++i];
         } else if (arg == "--quant-transformer" && i + 1 < argc) {
             cfg.quant_transformer = argv[++i];
+        } else if (arg == "--calibrate" && i + 1 < argc) {
+            cfg.calibrate = argv[++i];
         } else if (arg == "--width" && i + 1 < argc) {
             cfg.width = atoi(argv[++i]);
         } else if (arg == "--height" && i + 1 < argc) {
@@ -60,6 +63,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  -o, --output FILE       Output file (PPM or BMP)\n");
             fprintf(stderr, "  --model-dir DIR         Model directory\n");
             fprintf(stderr, "  --quant-transformer F   Pre-quantized transformer safetensors\n");
+            fprintf(stderr, "  --calibrate FILE        Capture calibration data for GPTQ (1 step)\n");
             fprintf(stderr, "  --width N               Image width (default: 512)\n");
             fprintf(stderr, "  --height N              Image height (default: 512)\n");
             fprintf(stderr, "  --steps N               Sampling steps (default: 20)\n");
@@ -354,19 +358,32 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_mean, latents_mean, 16 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_std, latents_std, 16 * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Calibration mode: run 1 denoising step capturing activations, then exit
+    CalibrationWriter cal_writer;
+    CalibrationWriter* cal_ptr = nullptr;
+    if (!cfg.calibrate.empty()) {
+        if (!cal_writer.open(cfg.calibrate.c_str())) {
+            fprintf(stderr, "ERROR: cannot open calibration file: %s\n", cfg.calibrate.c_str());
+            return 1;
+        }
+        cal_ptr = &cal_writer;
+        fprintf(stderr, "\n*** CALIBRATION MODE: capturing activations to %s ***\n", cfg.calibrate.c_str());
+    }
+
     // Denoising loop (latent stays in FP32 throughout, matching sd.cpp)
     // BF16 copy of latent for transformer input
     Tensor latent_bf16 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
     Tensor denoised_cond;
     Tensor denoised_uncond;
 
-    for (int step = 0; step < cfg.steps; step++) {
+    int actual_steps = cal_ptr ? 1 : cfg.steps; // calibrate only needs 1 step
+    for (int step = 0; step < actual_steps; step++) {
         float sigma = sigmas[step];
         float sigma_next = sigmas[step + 1];
         float timestep = sigma * 1000.0f;
 
         fprintf(stderr, "  Step %d/%d: sigma=%.4f, timestep=%.1f\n",
-                step + 1, cfg.steps, sigma, timestep);
+                step + 1, actual_steps, sigma, timestep);
 
         auto t_step = std::chrono::high_resolution_clock::now();
 
@@ -374,10 +391,10 @@ int main(int argc, char** argv) {
         fp32_to_bf16((float*)latent.data, (__nv_bfloat16*)latent_bf16.data, latent_numel);
 
         // Run transformer for conditional
-        denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w);
+        denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w, cal_ptr);
 
         // Run transformer for unconditional
-        denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w);
+        denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w, cal_ptr);
 
         int64_t n = denoised_cond.numel();
         // Dump raw cond/uncond outputs for comparison
@@ -465,6 +482,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "    Step time: %.0f ms\n", ms);
     }
     latent_bf16.free_data();
+
+    // Calibration mode: close file and exit early
+    if (cal_ptr) {
+        cal_writer.close();
+        auto t_end = std::chrono::high_resolution_clock::now();
+        float secs = std::chrono::duration<float>(t_end - t_start).count();
+        fprintf(stderr, "\nCalibration done! %u entries written to %s (%.1f seconds)\n",
+                cal_writer.num_entries, cfg.calibrate.c_str(), secs);
+        tf_weights.free_all();
+        pe.free_data(); pe_uncond.free_data();
+        cond_context.free_data(); uncond_context.free_data();
+        latent.free_data();
+        CUDA_CHECK(cudaFree(d_mean)); CUDA_CHECK(cudaFree(d_std));
+        return 0;
+    }
 
     // Free transformer
     fprintf(stderr, "\n  Freeing transformer...\n");

@@ -23,6 +23,7 @@
 struct QuantizeConfig {
     std::string model_dir = "./Qwen-Image-2512/";
     std::string output = "";
+    std::string gptq_cal; // optional: GPTQ calibration file
     bool int4 = false;
     int rank = 32;
     int group_size = 128;
@@ -42,6 +43,8 @@ static QuantizeConfig parse_args(int argc, char** argv) {
             cfg.rank = atoi(argv[++i]);
         } else if (arg == "--group-size" && i + 1 < argc) {
             cfg.group_size = atoi(argv[++i]);
+        } else if (arg == "--gptq" && i + 1 < argc) {
+            cfg.gptq_cal = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
             fprintf(stderr, "Usage: %s [options]\n", argv[0]);
             fprintf(stderr, "  --model-dir DIR     Model directory (default: ./Qwen-Image-2512/)\n");
@@ -49,6 +52,7 @@ static QuantizeConfig parse_args(int argc, char** argv) {
             fprintf(stderr, "  --int4              Use INT4 SVDQuant quantization (default: INT8)\n");
             fprintf(stderr, "  --rank N            SVD rank for INT4 mode (default: 32)\n");
             fprintf(stderr, "  --group-size N      Group size for INT4 quantization (default: 128)\n");
+            fprintf(stderr, "  --gptq FILE         GPTQ calibration file (requires --int4)\n");
             exit(0);
         }
     }
@@ -73,7 +77,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "=== Transformer Weight Quantizer ===\n");
     fprintf(stderr, "Model dir: %s\n", cfg.model_dir.c_str());
     fprintf(stderr, "Output:    %s\n", cfg.output.c_str());
-    fprintf(stderr, "Mode:      %s\n", cfg.int4 ? "INT4 SVDQuant" : "INT8 Hadamard");
+    fprintf(stderr, "Mode:      %s%s\n", cfg.int4 ? "INT4 SVDQuant" : "INT8 Hadamard",
+            cfg.gptq_cal.empty() ? "" : " + GPTQ");
     if (cfg.int4)
         fprintf(stderr, "SVD rank:  %d, group size: %d\n", cfg.rank, cfg.group_size);
 
@@ -160,9 +165,94 @@ int main(int argc, char** argv) {
         qw.free_data();
     };
 
+    // Load GPTQ calibration data if provided
+    CalibrationReader cal_reader;
+    if (!cfg.gptq_cal.empty()) {
+        if (!cfg.int4) {
+            fprintf(stderr, "ERROR: --gptq requires --int4\n");
+            return 1;
+        }
+        fprintf(stderr, "\nLoading GPTQ calibration from %s...\n", cfg.gptq_cal.c_str());
+        if (!cal_reader.load(cfg.gptq_cal.c_str())) {
+            fprintf(stderr, "ERROR: failed to load calibration file\n");
+            return 1;
+        }
+    }
+
+    // Name mapping: safetensors weight name → calibration entry name
+    auto get_cal_name = [](const std::string& weight_name) -> std::string {
+        // Extract block index from "transformer_blocks.{i}.xxx"
+        auto pos = weight_name.find("transformer_blocks.");
+        if (pos == std::string::npos) return "";
+        int block_idx = -1;
+        sscanf(weight_name.c_str() + pos + 19, "%d", &block_idx);
+        if (block_idx < 0) return "";
+
+        std::string prefix = "blocks." + std::to_string(block_idx) + ".";
+
+        if (weight_name.find("attn.to_q.weight") != std::string::npos ||
+            weight_name.find("attn.to_k.weight") != std::string::npos ||
+            weight_name.find("attn.to_v.weight") != std::string::npos)
+            return prefix + "img_attn_qkv";
+        if (weight_name.find("attn.to_out.0.weight") != std::string::npos)
+            return prefix + "img_attn_out";
+        if (weight_name.find("img_mlp.net.0.proj.weight") != std::string::npos)
+            return prefix + "img_mlp_in";
+        if (weight_name.find("img_mlp.net.2.weight") != std::string::npos)
+            return prefix + "img_mlp_mid";
+        return "";
+    };
+
+    // INT4 GPTQ quantization: uses calibration data for error-optimal rounding
+    auto quantize_and_add_int4_gptq = [&](const std::string& name) {
+        std::string cal_name = get_cal_name(name);
+        int cal_M = 0, cal_K = 0;
+        float* x_rot_gpu = nullptr;
+
+        if (!cal_name.empty()) {
+            x_rot_gpu = cal_reader.get_activation_gpu(cal_name, cal_M, cal_K);
+        }
+
+        if (!x_rot_gpu) {
+            // No calibration data → fall back to naive NF4
+            quantize_and_add_int4(name);
+            return;
+        }
+
+        Tensor bf16 = loader.load_tensor(name);
+        QuantizedWeight qw = quantize_weight_tensor_int4_gptq(bf16, cfg.rank, cfg.group_size,
+                                                                x_rot_gpu, cal_M, cal_K);
+        bf16.free_data();
+        CUDA_CHECK(cudaFree(x_rot_gpu));
+
+        int N = (int)qw.qweight.shape[0];
+        int K_packed = (int)qw.qweight.shape[1];
+        int num_groups = (int)qw.scales4.shape[1];
+        int r = qw.svd_rank;
+        int K_full = K_packed * 2;
+
+        auto qw_buf = download_tensor(qw.qweight);
+        auto sc_buf = download_tensor(qw.scales4);
+        auto up_buf = download_tensor(qw.svd_up);
+        auto dn_buf = download_tensor(qw.svd_down);
+
+        writer.add(name + ".__qweight__", "U8", {(int64_t)N, (int64_t)K_packed},
+                   qw_buf.data(), qw_buf.size());
+        writer.add(name + ".__scales4__", "F32", {(int64_t)N, (int64_t)num_groups},
+                   sc_buf.data(), sc_buf.size());
+        writer.add(name + ".__svd_up__", "BF16", {(int64_t)N, (int64_t)r},
+                   up_buf.data(), up_buf.size());
+        writer.add(name + ".__svd_down__", "BF16", {(int64_t)K_full, (int64_t)r},
+                   dn_buf.data(), dn_buf.size());
+
+        qw.free_data();
+    };
+
     // Dispatch to the right quantization function
     auto quantize_weight = [&](const std::string& name) {
-        if (cfg.int4)
+        if (cfg.int4 && !cfg.gptq_cal.empty())
+            quantize_and_add_int4_gptq(name);
+        else if (cfg.int4)
             quantize_and_add_int4(name);
         else
             quantize_and_add(name);
