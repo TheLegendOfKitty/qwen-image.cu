@@ -20,6 +20,7 @@
 struct Config {
     std::string prompt = "a red rose";
     std::string model_dir = "./Qwen-Image-2512/";
+    std::string quant_transformer; // optional: pre-quantized transformer safetensors file
     std::string output = "output.ppm";
     int width = 512;
     int height = 512;
@@ -39,6 +40,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.output = argv[++i];
         } else if (arg == "--model-dir" && i + 1 < argc) {
             cfg.model_dir = argv[++i];
+        } else if (arg == "--quant-transformer" && i + 1 < argc) {
+            cfg.quant_transformer = argv[++i];
         } else if (arg == "--width" && i + 1 < argc) {
             cfg.width = atoi(argv[++i]);
         } else if (arg == "--height" && i + 1 < argc) {
@@ -56,6 +59,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  -p, --prompt TEXT       Prompt text\n");
             fprintf(stderr, "  -o, --output FILE       Output file (PPM or BMP)\n");
             fprintf(stderr, "  --model-dir DIR         Model directory\n");
+            fprintf(stderr, "  --quant-transformer F   Pre-quantized transformer safetensors\n");
             fprintf(stderr, "  --width N               Image width (default: 512)\n");
             fprintf(stderr, "  --height N              Image height (default: 512)\n");
             fprintf(stderr, "  --steps N               Sampling steps (default: 20)\n");
@@ -275,7 +279,13 @@ int main(int argc, char** argv) {
 
     // ========== Step 4: Load transformer ==========
     fprintf(stderr, "\n[4/8] Loading transformer...\n");
-    SafeTensorsLoader tf_loader = load_model_dir(cfg.model_dir + "transformer");
+    SafeTensorsLoader tf_loader;
+    if (!cfg.quant_transformer.empty()) {
+        fprintf(stderr, "  Using pre-quantized: %s\n", cfg.quant_transformer.c_str());
+        tf_loader.load_file(cfg.quant_transformer);
+    } else {
+        tf_loader = load_model_dir(cfg.model_dir + "transformer");
+    }
     tf_loader.print_summary();
 
     TransformerWeights tf_weights;

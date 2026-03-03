@@ -27,12 +27,14 @@
     } \
 } while(0)
 
-enum class DType { BF16, FP32 };
+enum class DType { BF16, FP32, INT8, INT32 };
 
 inline size_t dtype_size(DType dt) {
     switch (dt) {
         case DType::BF16: return 2;
         case DType::FP32: return 4;
+        case DType::INT8: return 1;
+        case DType::INT32: return 4;
     }
     return 0;
 }
@@ -41,6 +43,8 @@ inline const char* dtype_name(DType dt) {
     switch (dt) {
         case DType::BF16: return "BF16";
         case DType::FP32: return "FP32";
+        case DType::INT8: return "INT8";
+        case DType::INT32: return "INT32";
     }
     return "???";
 }

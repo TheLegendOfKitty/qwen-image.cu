@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <algorithm>
 #include "tensor.h"
 
 // ===== Type conversion =====
@@ -172,6 +173,81 @@ void bf16_to_rgb8(const __nv_bfloat16* in, uint8_t* out, int H, int W, cudaStrea
 // ===== Linear layer implementation =====
 void linear_forward(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out);
 void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out);
+
+// ================================================================
+// INT8 QUANTIZATION SUPPORT
+// Per-channel symmetric weight quantization + per-token dynamic
+// activation quantization with INT8 tensor core GEMMs.
+// ================================================================
+
+// Quantized weight: INT8 data + FP32 per-output-channel scales
+// Weights are Hadamard-rotated before quantization for better quality.
+struct QuantizedWeight {
+    Tensor data;       // [N, K] INT8
+    Tensor scales;     // [N] FP32
+    int had_block_size; // Hadamard block size used for rotation (power of 2)
+
+    QuantizedWeight() : had_block_size(0) {}
+    QuantizedWeight(QuantizedWeight&&) = default;
+    QuantizedWeight& operator=(QuantizedWeight&&) = default;
+
+    void free_data() {
+        data.free_data();
+        scales.free_data();
+    }
+};
+
+// Fast Walsh-Hadamard Transform (in-place, block-diagonal)
+// Applies FWHT to each row of data[M, K], using blocks of had_block_size.
+// K must be divisible by had_block_size, and had_block_size must be power of 2.
+void fwht_inplace(float* data, int M, int K, int had_block_size, cudaStream_t stream = 0);
+
+// Compute the Hadamard block size for a given dimension (largest power of 2 dividing K)
+inline int hadamard_block_size(int K) { return K & (-K); }
+
+// Quantize BF16 weight to INT8 per-output-channel symmetric: scale[i] = max(|row_i|) / 127
+void quantize_weight_per_channel(const __nv_bfloat16* weight, int8_t* out, float* scales,
+                                  int N, int K, cudaStream_t stream = 0);
+
+// Quantize FP32 data to INT8 per-row symmetric: scale[i] = max(|row_i|) / 127
+void quantize_per_row_fp32(const float* x, int8_t* out, float* scales,
+                            int M, int K, cudaStream_t stream = 0);
+
+// Quantize FP32 activation to INT8 per-token: scale[i] = max(|row_i|) / 127
+void quantize_activation_per_token_fp32(const float* x, int8_t* out, float* scales,
+                                         int M, int K, cudaStream_t stream = 0);
+
+// Quantize BF16 activation to INT8 per-token
+void quantize_activation_per_token_bf16(const __nv_bfloat16* x, int8_t* out, float* scales,
+                                         int M, int K, cudaStream_t stream = 0);
+
+// Dequantize INT32 GEMM output: out_fp32[i,j] = gemm_out[i,j] * act_scale[i] * w_scale[j] + bias[j]
+void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+                          const __nv_bfloat16* bias, float* out,
+                          int M, int N, cudaStream_t stream = 0);
+
+// INT8 linear with Hadamard rotation: FP32 input × INT8 weight → FP32 output
+// Applies FWHT to activation before quantization to match weight rotation.
+void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
+                          const Tensor* bias, Tensor& out, Tensor& scratch);
+
+// INT8 linear with Hadamard rotation: BF16 input × INT8 weight → FP32 output
+void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
+                                 const Tensor* bias, Tensor& out, Tensor& scratch);
+
+// Helper: quantize a BF16 weight tensor at load time (with Hadamard rotation)
+QuantizedWeight quantize_weight_tensor(const Tensor& bf16_weight);
+
+// Helper: compute required scratch bytes for INT8 GEMM with Hadamard rotation
+inline int64_t int8_scratch_bytes(int M, int K, int N) {
+    // Region A: max(M*K*4, M*N*4) for FP32 temp (Hadamard) then reused for INT32 output
+    int64_t regionA = (((int64_t)std::max((int64_t)M * K, (int64_t)M * N) * 4 + 255) & ~255LL);
+    // INT8 quantized activations
+    int64_t act = (((int64_t)M * K + 255) & ~255LL);
+    // FP32 per-token scales
+    int64_t scales = (((int64_t)M * 4 + 255) & ~255LL);
+    return regionA + act + scales;
+}
 
 // ================================================================
 // FP32 INTERMEDIATE PRECISION KERNELS

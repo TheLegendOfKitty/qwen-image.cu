@@ -10,7 +10,10 @@ TARGET = qwen-image
 $(TARGET): $(SRCS) $(wildcard *.h *.cuh)
 	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) $(SRCS) -o $@ $(LIBS)
 
+quantize: quantize.cu cuda_kernels.cu $(wildcard *.h *.cuh)
+	$(NVCC) $(FLAGS) $(CUDA_ARCH) $(INCLUDES) quantize.cu cuda_kernels.cu -o $@ $(LIBS)
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) quantize
 
 .PHONY: clean

@@ -1975,3 +1975,386 @@ void gate_add_fp32f(const float* input, const float* gate, const float* x,
     int grid = (total + block - 1) / block;
     gate_add_fp32f_kernel<<<grid, block, 0, stream>>>(input, gate, x, out, rows, dim);
 }
+
+// ================================================================
+// INT8 QUANTIZATION KERNELS
+// Per-channel symmetric weight quantization + per-token dynamic
+// activation quantization for INT8 tensor core GEMMs.
+// ================================================================
+
+// ==================== Fast Walsh-Hadamard Transform ====================
+// In-place FWHT on each row of data[M, K], block-diagonal with had_block_size.
+// The normalized Hadamard is an orthogonal involution: H @ H = I.
+
+__global__ void fwht_inplace_kernel(float* data, int M, int K, int block_size) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    float* row_data = data + (int64_t)row * K;
+    int num_blocks = K / block_size;
+
+    for (int blk = 0; blk < num_blocks; blk++) {
+        float* bdata = row_data + blk * block_size;
+
+        // Butterfly stages of the Walsh-Hadamard transform
+        for (int half = 1; half < block_size; half <<= 1) {
+            int full = half << 1;
+            int num_pairs = block_size / 2;
+
+            for (int pair = threadIdx.x; pair < num_pairs; pair += blockDim.x) {
+                int group = pair / half;
+                int within = pair % half;
+                int idx_a = group * full + within;
+                int idx_b = idx_a + half;
+
+                float a = bdata[idx_a];
+                float b = bdata[idx_b];
+                bdata[idx_a] = a + b;
+                bdata[idx_b] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Normalize by 1/sqrt(block_size) to make it orthogonal
+        float norm = rsqrtf((float)block_size);
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+            bdata[i] *= norm;
+        }
+        __syncthreads();
+    }
+}
+
+void fwht_inplace(float* data, int M, int K, int had_block_size, cudaStream_t stream) {
+    int threads = min(1024, had_block_size / 2);
+    threads = max(32, ((threads + 31) / 32) * 32);
+    fwht_inplace_kernel<<<M, threads, 0, stream>>>(data, M, K, had_block_size);
+}
+
+// Warp + block reduction for max value (shared across quantization kernels)
+__device__ float block_reduce_max(float val) {
+    // Warp reduce
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int warp = threadIdx.x / warpSize;
+    if (lane == 0) shared[warp] = val;
+    __syncthreads();
+    if (warp == 0) {
+        val = (lane < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) shared[0] = val;
+    __syncthreads();
+    return shared[0];
+}
+
+// Quantize BF16 weight per-output-channel: one block per row
+__global__ void quantize_weight_per_channel_kernel(
+    const __nv_bfloat16* weight, int8_t* out, float* scales, int N, int K) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    const __nv_bfloat16* row_ptr = weight + (int64_t)row * K;
+
+    // Find max absolute value in this row
+    float max_val = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = fabsf(__bfloat162float(row_ptr[i]));
+        max_val = fmaxf(max_val, v);
+    }
+    max_val = block_reduce_max(max_val);
+
+    float scale = max_val / 127.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+
+    float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+
+    // Quantize
+    int8_t* out_row = out + (int64_t)row * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = __bfloat162float(row_ptr[i]) * inv_scale;
+        int vi = __float2int_rn(v);
+        vi = max(-128, min(127, vi));
+        out_row[i] = (int8_t)vi;
+    }
+}
+
+void quantize_weight_per_channel(const __nv_bfloat16* weight, int8_t* out, float* scales,
+                                  int N, int K, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    quantize_weight_per_channel_kernel<<<N, threads, 0, stream>>>(weight, out, scales, N, K);
+}
+
+// Quantize FP32 data per-row (used for Hadamard-rotated weights): one block per row
+__global__ void quantize_per_row_fp32_kernel(
+    const float* x, int8_t* out, float* scales, int M, int K) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    const float* row_ptr = x + (int64_t)row * K;
+
+    float max_val = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        max_val = fmaxf(max_val, fabsf(row_ptr[i]));
+    }
+    max_val = block_reduce_max(max_val);
+
+    float scale = max_val / 127.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+
+    float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+
+    int8_t* out_row = out + (int64_t)row * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = row_ptr[i] * inv_scale;
+        int vi = __float2int_rn(v);
+        vi = max(-128, min(127, vi));
+        out_row[i] = (int8_t)vi;
+    }
+}
+
+void quantize_per_row_fp32(const float* x, int8_t* out, float* scales,
+                            int M, int K, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    quantize_per_row_fp32_kernel<<<M, threads, 0, stream>>>(x, out, scales, M, K);
+}
+
+// Quantize FP32 activation per-token: one block per row
+__global__ void quantize_activation_per_token_fp32_kernel(
+    const float* x, int8_t* out, float* scales, int M, int K) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    const float* row_ptr = x + (int64_t)row * K;
+
+    float max_val = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        max_val = fmaxf(max_val, fabsf(row_ptr[i]));
+    }
+    max_val = block_reduce_max(max_val);
+
+    float scale = max_val / 127.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+
+    float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+
+    int8_t* out_row = out + (int64_t)row * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = row_ptr[i] * inv_scale;
+        int vi = __float2int_rn(v);
+        vi = max(-128, min(127, vi));
+        out_row[i] = (int8_t)vi;
+    }
+}
+
+void quantize_activation_per_token_fp32(const float* x, int8_t* out, float* scales,
+                                         int M, int K, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    quantize_activation_per_token_fp32_kernel<<<M, threads, 0, stream>>>(x, out, scales, M, K);
+}
+
+// Quantize BF16 activation per-token: one block per row
+__global__ void quantize_activation_per_token_bf16_kernel(
+    const __nv_bfloat16* x, int8_t* out, float* scales, int M, int K) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    const __nv_bfloat16* row_ptr = x + (int64_t)row * K;
+
+    float max_val = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        max_val = fmaxf(max_val, fabsf(__bfloat162float(row_ptr[i])));
+    }
+    max_val = block_reduce_max(max_val);
+
+    float scale = max_val / 127.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+
+    float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+
+    int8_t* out_row = out + (int64_t)row * K;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = __bfloat162float(row_ptr[i]) * inv_scale;
+        int vi = __float2int_rn(v);
+        vi = max(-128, min(127, vi));
+        out_row[i] = (int8_t)vi;
+    }
+}
+
+void quantize_activation_per_token_bf16(const __nv_bfloat16* x, int8_t* out, float* scales,
+                                         int M, int K, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    quantize_activation_per_token_bf16_kernel<<<M, threads, 0, stream>>>(x, out, scales, M, K);
+}
+
+// Dequantize INT32 GEMM output + add bias
+// out[i,j] = gemm_out[i,j] * act_scales[i] * w_scales[j] + bias[j]
+__global__ void dequantize_and_bias_kernel(
+    const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+    const __nv_bfloat16* bias, float* out, int M, int N) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)M * N) return;
+    int row = (int)(idx / N);
+    int col = (int)(idx % N);
+    float val = (float)gemm_out[idx] * act_scales[row] * w_scales[col];
+    if (bias) val += __bfloat162float(bias[col]);
+    out[idx] = val;
+}
+
+void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+                          const __nv_bfloat16* bias, float* out,
+                          int M, int N, cudaStream_t stream) {
+    int64_t total = (int64_t)M * N;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    dequantize_and_bias_kernel<<<grid, block, 0, stream>>>(
+        gemm_out, act_scales, w_scales, bias, out, M, N);
+}
+
+// ==================== INT8 Linear Forward (with Hadamard Rotation) ====================
+
+// FP32 input × INT8 weight → FP32 output
+// Applies Hadamard rotation to activation before quantization.
+void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
+                          const Tensor* bias, Tensor& out, Tensor& scratch) {
+    int M = (int)x.shape[0];
+    int K = (int)x.shape[1];
+    int N = (int)weight.data.shape[0];
+
+    assert(x.dtype == DType::FP32);
+    assert(weight.data.dtype == DType::INT8);
+    assert(weight.scales.dtype == DType::FP32);
+    assert(out.dtype == DType::FP32);
+    assert(weight.data.shape[1] == K);
+    assert(out.shape[0] == M && out.shape[1] == N);
+
+    // Scratch layout:
+    // [Region A: max(M*K*4, M*N*4)] - FP32 temp for Hadamard, then reused for INT32 output
+    // [INT8 act: align256(M*K)]
+    // [FP32 scales: align256(M*4)]
+    int64_t regionA_size = (((int64_t)std::max((int64_t)M * K, (int64_t)M * N) * 4 + 255) & ~255LL);
+    int64_t int8_offset = regionA_size;
+    int64_t int8_size = (((int64_t)M * K + 255) & ~255LL);
+    int64_t scales_offset = int8_offset + int8_size;
+
+    float* fp32_temp = (float*)scratch.data;
+    int8_t* act_int8 = (int8_t*)((char*)scratch.data + int8_offset);
+    float* act_scales = (float*)((char*)scratch.data + scales_offset);
+
+    // Step 1: Copy activation to scratch and apply Hadamard rotation
+    CUDA_CHECK(cudaMemcpy(fp32_temp, x.data, (int64_t)M * K * sizeof(float), cudaMemcpyDeviceToDevice));
+    if (weight.had_block_size > 1) {
+        fwht_inplace(fp32_temp, M, K, weight.had_block_size);
+    }
+
+    // Step 2: Quantize rotated activation per-token
+    quantize_activation_per_token_fp32(fp32_temp, act_int8, act_scales, M, K);
+
+    // Step 3: INT8 GEMM (reuse Region A for INT32 output)
+    int32_t* gemm_out = (int32_t*)scratch.data;
+    int32_t alpha_i = 1, beta_i = 0;
+    CUBLAS_CHECK(cublasGemmEx(
+        cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha_i,
+        weight.data.data, CUDA_R_8I, K,
+        act_int8,          CUDA_R_8I, K,
+        &beta_i,
+        gemm_out,          CUDA_R_32I, N,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // Step 4: Dequantize and add bias
+    dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
+                        bias ? (__nv_bfloat16*)bias->data : nullptr,
+                        (float*)out.data, M, N);
+}
+
+// BF16 input × INT8 weight → FP32 output (with Hadamard rotation)
+void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
+                                 const Tensor* bias, Tensor& out, Tensor& scratch) {
+    int M = (int)x.shape[0];
+    int K = (int)x.shape[1];
+    int N = (int)weight.data.shape[0];
+
+    assert(x.dtype == DType::BF16);
+    assert(weight.data.dtype == DType::INT8);
+    assert(out.dtype == DType::FP32);
+
+    int64_t regionA_size = (((int64_t)std::max((int64_t)M * K, (int64_t)M * N) * 4 + 255) & ~255LL);
+    int64_t int8_offset = regionA_size;
+    int64_t int8_size = (((int64_t)M * K + 255) & ~255LL);
+    int64_t scales_offset = int8_offset + int8_size;
+
+    float* fp32_temp = (float*)scratch.data;
+    int8_t* act_int8 = (int8_t*)((char*)scratch.data + int8_offset);
+    float* act_scales = (float*)((char*)scratch.data + scales_offset);
+
+    // Step 1: Convert BF16 → FP32 and apply Hadamard rotation
+    bf16_to_fp32((__nv_bfloat16*)x.data, fp32_temp, (int64_t)M * K);
+    if (weight.had_block_size > 1) {
+        fwht_inplace(fp32_temp, M, K, weight.had_block_size);
+    }
+
+    // Step 2: Quantize rotated activation per-token
+    quantize_activation_per_token_fp32(fp32_temp, act_int8, act_scales, M, K);
+
+    // Step 3: INT8 GEMM (reuse Region A for INT32 output)
+    int32_t* gemm_out = (int32_t*)scratch.data;
+    int32_t alpha_i = 1, beta_i = 0;
+    CUBLAS_CHECK(cublasGemmEx(
+        cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha_i,
+        weight.data.data, CUDA_R_8I, K,
+        act_int8,          CUDA_R_8I, K,
+        &beta_i,
+        gemm_out,          CUDA_R_32I, N,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // Step 4: Dequantize and add bias
+    dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
+                        bias ? (__nv_bfloat16*)bias->data : nullptr,
+                        (float*)out.data, M, N);
+}
+
+// Helper: quantize a BF16 weight tensor at load time (with Hadamard rotation)
+QuantizedWeight quantize_weight_tensor(const Tensor& bf16_weight) {
+    assert(bf16_weight.dtype == DType::BF16);
+    assert(bf16_weight.ndim == 2);
+
+    int N = (int)bf16_weight.shape[0];
+    int K = (int)bf16_weight.shape[1];
+    int hbs = hadamard_block_size(K);
+
+    // Convert BF16 → FP32
+    Tensor fp32_weight = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+    bf16_to_fp32((__nv_bfloat16*)bf16_weight.data, (float*)fp32_weight.data, (int64_t)N * K);
+
+    // Apply Hadamard rotation to K dimension of each row
+    if (hbs > 1) {
+        fwht_inplace((float*)fp32_weight.data, N, K, hbs);
+    }
+
+    // Quantize rotated FP32 weights to INT8 per-channel
+    QuantizedWeight qw;
+    qw.data = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::INT8);
+    qw.scales = Tensor::alloc({(int64_t)N}, DType::FP32);
+    qw.had_block_size = hbs;
+
+    quantize_per_row_fp32(
+        (float*)fp32_weight.data,
+        (int8_t*)qw.data.data,
+        (float*)qw.scales.data,
+        N, K);
+
+    fp32_weight.free_data();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return qw;
+}

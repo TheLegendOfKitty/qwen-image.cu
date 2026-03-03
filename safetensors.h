@@ -84,6 +84,8 @@ public:
                 // We'll treat F16 as BF16 size for loading, convert later if needed
                 info.dtype = DType::BF16;
                 fprintf(stderr, "Warning: tensor '%s' is F16, treating as BF16\n", key.c_str());
+            } else if (dtype_str == "I8" || dtype_str == "int8") {
+                info.dtype = DType::INT8;
             } else {
                 fprintf(stderr, "Unknown dtype '%s' for tensor '%s'\n", dtype_str.c_str(), key.c_str());
                 continue;
