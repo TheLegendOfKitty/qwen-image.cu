@@ -2363,7 +2363,13 @@ QuantizedWeight quantize_weight_tensor(const Tensor& bf16_weight) {
 // INT4 SVDQuant KERNELS
 // ================================================================
 
-// Dequantize packed INT4 [N, K/2] + per-group scales [N, K/gs] -> BF16 [N, K]
+// NF4 (NormalFloat4) lookup table: quantiles of N(0,1) normalized to [-1, 1]
+__device__ __constant__ float NF4_GRID[16] = {
+    -1.0f, -0.6962f, -0.5251f, -0.3949f, -0.2844f, -0.1848f, -0.0911f, 0.0f,
+     0.0796f,  0.1609f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f, 1.0f
+};
+
+// Dequantize packed NF4 [N, K/2] + per-group scales [N, K/gs] -> BF16 [N, K]
 __global__ void dequantize_int4_to_bf16_kernel(
     const uint8_t* __restrict__ qweight,
     const float* __restrict__ scales,
@@ -2378,8 +2384,8 @@ __global__ void dequantize_int4_to_bf16_kernel(
     int byte_col = (int)(idx % (K / 2));
 
     uint8_t packed = qweight[idx];
-    int v0 = (int)((int8_t)(packed << 4) >> 4);  // sign-extend low nibble
-    int v1 = (int)((int8_t)packed >> 4);          // sign-extend high nibble
+    int idx0 = packed & 0xF;
+    int idx1 = (packed >> 4) & 0xF;
 
     int col0 = byte_col * 2;
     int col1 = byte_col * 2 + 1;
@@ -2388,8 +2394,8 @@ __global__ void dequantize_int4_to_bf16_kernel(
     float s0 = scales[(int64_t)row * num_groups + col0 / group_size];
     float s1 = scales[(int64_t)row * num_groups + col1 / group_size];
 
-    out[(int64_t)row * K + col0] = __float2bfloat16((float)v0 * s0);
-    out[(int64_t)row * K + col1] = __float2bfloat16((float)v1 * s1);
+    out[(int64_t)row * K + col0] = __float2bfloat16(NF4_GRID[idx0] * s0);
+    out[(int64_t)row * K + col1] = __float2bfloat16(NF4_GRID[idx1] * s1);
 }
 
 void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
@@ -2402,8 +2408,8 @@ void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
         qweight, scales, out, N, K, group_size);
 }
 
-// Quantize FP32 residual [N, K] to packed INT4 [N, K/2] + per-group scales [N, K/gs]
-// Symmetric: scale = max(|group|) / 7, values clamped to [-7, 7]
+// Quantize FP32 residual [N, K] to packed NF4 [N, K/2] + per-group scales [N, K/gs]
+// NF4: scale = max(|group|), values mapped to nearest NF4 grid point
 __global__ void quantize_int4_per_group_kernel(
     const float* __restrict__ residual,
     uint8_t* __restrict__ qweight,
@@ -2444,22 +2450,31 @@ __global__ void quantize_int4_per_group_kernel(
     __syncthreads();
     max_abs = s_max[0];
 
-    float scale = max_abs / 7.0f;
+    float scale = max_abs;  // NF4 grid spans [-1, 1], no division by 7
     if (threadIdx.x == 0)
         scales[(int64_t)row * num_groups + group] = scale;
 
     float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
 
-    // Quantize pairs and pack
+    // Quantize pairs and pack using nearest NF4 grid point
     int half_gs = group_size / 2;
     for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
         int c0 = col_start + i * 2;
         int c1 = c0 + 1;
-        float v0 = residual[(int64_t)row * K + c0];
-        float v1 = residual[(int64_t)row * K + c1];
-        int q0 = max(-7, min(7, (int)roundf(v0 * inv_scale)));
-        int q1 = max(-7, min(7, (int)roundf(v1 * inv_scale)));
-        uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+        float n0 = residual[(int64_t)row * K + c0] * inv_scale;
+        float n1 = residual[(int64_t)row * K + c1] * inv_scale;
+
+        // Find nearest NF4 grid entry (linear scan, 16 entries — compiler unrolls)
+        int q0 = 0, q1 = 0;
+        float best0 = 1e9f, best1 = 1e9f;
+        for (int j = 0; j < 16; j++) {
+            float d0 = fabsf(n0 - NF4_GRID[j]);
+            float d1 = fabsf(n1 - NF4_GRID[j]);
+            if (d0 < best0) { best0 = d0; q0 = j; }
+            if (d1 < best1) { best1 = d1; q1 = j; }
+        }
+
+        uint8_t packed = (uint8_t)(q0 | (q1 << 4));
         qweight[(int64_t)row * (K / 2) + (c0 / 2)] = packed;
     }
 }
