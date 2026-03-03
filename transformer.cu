@@ -129,11 +129,17 @@ Tensor transformer_forward(const TransformerWeights& w,
                  1, (int)x_in.shape[1], H, W, patch_size, patch_size);
     }
 
-    // Scratch for INT8 GEMM: holds quantized activation (INT8) + per-token scales (FP32) + INT32 output.
-    // Compute max scratch bytes needed across all linear layers.
+    // Scratch for quantized GEMM. Mode-aware: INT8 or INT4+SVD.
+    QuantMode qmode = w.img_in_weight.mode;
+    int svd_rank = (qmode == QuantMode::INT4_SVD) ? w.img_in_weight.svd_rank : 0;
+
     int64_t max_scratch_bytes = 0;
     auto grow_scratch = [&](int M, int K, int N) {
-        int64_t bytes = int8_scratch_bytes(M, K, N);
+        int64_t bytes;
+        if (qmode == QuantMode::INT4_SVD)
+            bytes = int4_scratch_bytes(M, K, N, svd_rank);
+        else
+            bytes = int8_scratch_bytes(M, K, N);
         if (bytes > max_scratch_bytes) max_scratch_bytes = bytes;
     };
 
@@ -167,7 +173,7 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     Tensor t_after_l1 = Tensor::alloc({1, inner_dim}, DType::FP32);
     {
-        linear_forward_int8(t_emb_sin, w.time_linear1_weight, &w.time_linear1_bias,
+        linear_forward_quantized(t_emb_sin, w.time_linear1_weight, &w.time_linear1_bias,
                             t_after_l1, gemm_scratch);
     }
     silu_fp32((float*)t_after_l1.data, (float*)t_after_l1.data, inner_dim);
@@ -175,7 +181,7 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     Tensor t_emb = Tensor::alloc({1, inner_dim}, DType::FP32);
     {
-        linear_forward_int8(t_after_l1, w.time_linear2_weight, &w.time_linear2_bias,
+        linear_forward_quantized(t_after_l1, w.time_linear2_weight, &w.time_linear2_bias,
                             t_emb, gemm_scratch);
     }
     t_after_l1.free_data();
@@ -229,7 +235,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     {
         Tensor patches_2d = img_patches.view({n_img, in_channels});
         Tensor img_2d = img.view({n_img, inner_dim});
-        linear_forward_int8_bf16in(patches_2d, w.img_in_weight, &w.img_in_bias, img_2d, gemm_scratch);
+        linear_forward_quantized_bf16in(patches_2d, w.img_in_weight, &w.img_in_bias, img_2d, gemm_scratch);
     }
     dump("cuda_img_patches.bin", img_patches.data, (int64_t)n_img * in_channels, true);
     img_patches.free_data();
@@ -247,7 +253,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     {
         Tensor tn_2d = txt_normed.view({n_txt, 3584});
         Tensor txt_2d = txt.view({n_txt, inner_dim});
-        linear_forward_int8_bf16in(tn_2d, w.txt_in_weight, &w.txt_in_bias, txt_2d, gemm_scratch);
+        linear_forward_quantized_bf16in(tn_2d, w.txt_in_weight, &w.txt_in_bias, txt_2d, gemm_scratch);
     }
     txt_normed.free_data();
 
@@ -316,9 +322,9 @@ Tensor transformer_forward(const TransformerWeights& w,
         // Compute modulation: silu(t_emb) -> Linear -> chunk(6) in FP32.
         silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
         {
-            linear_forward_int8(t_emb_silu, b.img_mod_weight, &b.img_mod_bias,
+            linear_forward_quantized(t_emb_silu, b.img_mod_weight, &b.img_mod_bias,
                                 img_mod_buf, gemm_scratch);
-            linear_forward_int8(t_emb_silu, b.txt_mod_weight, &b.txt_mod_bias,
+            linear_forward_quantized(t_emb_silu, b.txt_mod_weight, &b.txt_mod_bias,
                                 txt_mod_buf, gemm_scratch);
         }
 
@@ -359,17 +365,17 @@ Tensor transformer_forward(const TransformerWeights& w,
             Tensor oq = img_q.view({n_img, inner_dim});
             Tensor ok = img_k.view({n_img, inner_dim});
             Tensor ov = img_v.view({n_img, inner_dim});
-            linear_forward_int8(img_normed_fp32, b.to_q_weight, &b.to_q_bias, oq, gemm_scratch);
-            linear_forward_int8(img_normed_fp32, b.to_k_weight, &b.to_k_bias, ok, gemm_scratch);
-            linear_forward_int8(img_normed_fp32, b.to_v_weight, &b.to_v_bias, ov, gemm_scratch);
+            linear_forward_quantized(img_normed_fp32, b.to_q_weight, &b.to_q_bias, oq, gemm_scratch);
+            linear_forward_quantized(img_normed_fp32, b.to_k_weight, &b.to_k_bias, ok, gemm_scratch);
+            linear_forward_quantized(img_normed_fp32, b.to_v_weight, &b.to_v_bias, ov, gemm_scratch);
         }
         {
             Tensor oq = txt_q.view({n_txt, inner_dim});
             Tensor ok = txt_k.view({n_txt, inner_dim});
             Tensor ov = txt_v.view({n_txt, inner_dim});
-            linear_forward_int8(txt_normed_fp32, b.add_q_proj_weight, &b.add_q_proj_bias, oq, gemm_scratch);
-            linear_forward_int8(txt_normed_fp32, b.add_k_proj_weight, &b.add_k_proj_bias, ok, gemm_scratch);
-            linear_forward_int8(txt_normed_fp32, b.add_v_proj_weight, &b.add_v_proj_bias, ov, gemm_scratch);
+            linear_forward_quantized(txt_normed_fp32, b.add_q_proj_weight, &b.add_q_proj_bias, oq, gemm_scratch);
+            linear_forward_quantized(txt_normed_fp32, b.add_k_proj_weight, &b.add_k_proj_bias, ok, gemm_scratch);
+            linear_forward_quantized(txt_normed_fp32, b.add_v_proj_weight, &b.add_v_proj_bias, ov, gemm_scratch);
         }
 
         if (dump_internal_block) {
@@ -461,10 +467,10 @@ Tensor transformer_forward(const TransformerWeights& w,
         // Output projections: FP32 activations → INT8 GEMM → FP32 output.
         {
             Tensor ip_2d = img_proj.view({n_img, inner_dim});
-            linear_forward_int8(img_attn_out, b.to_out_weight, &b.to_out_bias, ip_2d, gemm_scratch);
+            linear_forward_quantized(img_attn_out, b.to_out_weight, &b.to_out_bias, ip_2d, gemm_scratch);
 
             Tensor tp_2d = txt_proj.view({n_txt, inner_dim});
-            linear_forward_int8(txt_attn_out, b.to_add_out_weight, &b.to_add_out_bias, tp_2d, gemm_scratch);
+            linear_forward_quantized(txt_attn_out, b.to_add_out_weight, &b.to_add_out_bias, tp_2d, gemm_scratch);
         }
 
         if (dump_internal_block) {
@@ -502,23 +508,23 @@ Tensor transformer_forward(const TransformerWeights& w,
         if (dump_internal_block) dump_internal("img_mlp_input.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
         {
             Tensor mlp_2d = img_mlp_fp32.view({n_img, mlp_dim});
-            linear_forward_int8(img_normed_fp32, b.img_mlp_fc1_weight, &b.img_mlp_fc1_bias, mlp_2d, gemm_scratch);
+            linear_forward_quantized(img_normed_fp32, b.img_mlp_fc1_weight, &b.img_mlp_fc1_bias, mlp_2d, gemm_scratch);
             if (dump_internal_block) dump_internal("img_mlp_fc1.bin", img_mlp_fp32.data, (int64_t)n_img * mlp_dim, false);
             // GELU in FP32
             gelu_fp32((float*)img_mlp_fp32.data, (float*)img_mlp_fp32.data,
                       (int64_t)n_img * mlp_dim);
             if (dump_internal_block) dump_internal("img_mlp_gelu.bin", img_mlp_fp32.data, (int64_t)n_img * mlp_dim, false);
             Tensor out_2d = img_mlp_out.view({n_img, inner_dim});
-            linear_forward_int8(img_mlp_fp32, b.img_mlp_fc2_weight, &b.img_mlp_fc2_bias, out_2d, gemm_scratch);
+            linear_forward_quantized(img_mlp_fp32, b.img_mlp_fc2_weight, &b.img_mlp_fc2_bias, out_2d, gemm_scratch);
             if (dump_internal_block) dump_internal("img_mlp_out.bin", img_mlp_out.data, (int64_t)n_img * inner_dim, false);
         }
         {
             Tensor mlp_2d = txt_mlp_fp32.view({n_txt, mlp_dim});
-            linear_forward_int8(txt_normed_fp32, b.txt_mlp_fc1_weight, &b.txt_mlp_fc1_bias, mlp_2d, gemm_scratch);
+            linear_forward_quantized(txt_normed_fp32, b.txt_mlp_fc1_weight, &b.txt_mlp_fc1_bias, mlp_2d, gemm_scratch);
             gelu_fp32((float*)txt_mlp_fp32.data, (float*)txt_mlp_fp32.data,
                       (int64_t)n_txt * mlp_dim);
             Tensor out_2d = txt_mlp_out.view({n_txt, inner_dim});
-            linear_forward_int8(txt_mlp_fp32, b.txt_mlp_fc2_weight, &b.txt_mlp_fc2_bias, out_2d, gemm_scratch);
+            linear_forward_quantized(txt_mlp_fp32, b.txt_mlp_fc2_weight, &b.txt_mlp_fc2_bias, out_2d, gemm_scratch);
         }
 
         // Residual: img_fp32 += gate2 * FP32_mlp_out
@@ -550,7 +556,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     // 4. AdaLayerNormContinuous output
     Tensor ada_emb = Tensor::alloc({1, 2 * inner_dim}, DType::FP32);
     silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
-    linear_forward_int8(t_emb_silu, w.norm_out_linear_weight, &w.norm_out_linear_bias,
+    linear_forward_quantized(t_emb_silu, w.norm_out_linear_weight, &w.norm_out_linear_bias,
                         ada_emb, gemm_scratch);
     auto* ada_mods = (float*)ada_emb.data;
 
@@ -565,7 +571,7 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     // 5. Project out: [n_img, 3072] -> [n_img, 64]
     Tensor img_proj_out_fp32 = Tensor::alloc({n_img, (int64_t)(patch_size * patch_size * out_channels)}, DType::FP32);
-    linear_forward_int8(img_normed_fp32, w.proj_out_weight, &w.proj_out_bias,
+    linear_forward_quantized(img_normed_fp32, w.proj_out_weight, &w.proj_out_bias,
                         img_proj_out_fp32, gemm_scratch);
 
     Tensor img_proj_out = Tensor::alloc({n_img, (int64_t)(patch_size * patch_size * out_channels)}, DType::BF16);

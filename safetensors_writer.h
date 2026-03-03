@@ -14,7 +14,7 @@ class SafeTensorsWriter {
 public:
     struct Entry {
         std::string name;
-        std::string dtype_str; // "I8", "F32", "BF16"
+        std::string dtype_str; // "I8", "U8", "F32", "BF16"
         std::vector<int64_t> shape;
         std::vector<uint8_t> data;
     };

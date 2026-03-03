@@ -2358,3 +2358,531 @@ QuantizedWeight quantize_weight_tensor(const Tensor& bf16_weight) {
     CUDA_CHECK(cudaDeviceSynchronize());
     return qw;
 }
+
+// ================================================================
+// INT4 SVDQuant KERNELS
+// ================================================================
+
+// Dequantize packed INT4 [N, K/2] + per-group scales [N, K/gs] -> BF16 [N, K]
+__global__ void dequantize_int4_to_bf16_kernel(
+    const uint8_t* __restrict__ qweight,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K, int group_size)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    if (idx >= total_bytes) return;
+
+    int row = (int)(idx / (K / 2));
+    int byte_col = (int)(idx % (K / 2));
+
+    uint8_t packed = qweight[idx];
+    int v0 = (int)((int8_t)(packed << 4) >> 4);  // sign-extend low nibble
+    int v1 = (int)((int8_t)packed >> 4);          // sign-extend high nibble
+
+    int col0 = byte_col * 2;
+    int col1 = byte_col * 2 + 1;
+
+    int num_groups = K / group_size;
+    float s0 = scales[(int64_t)row * num_groups + col0 / group_size];
+    float s1 = scales[(int64_t)row * num_groups + col1 / group_size];
+
+    out[(int64_t)row * K + col0] = __float2bfloat16((float)v0 * s0);
+    out[(int64_t)row * K + col1] = __float2bfloat16((float)v1 * s1);
+}
+
+void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
+                              __nv_bfloat16* out, int N, int K, int group_size,
+                              cudaStream_t stream) {
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    int block = 256;
+    int grid = (int)((total_bytes + block - 1) / block);
+    dequantize_int4_to_bf16_kernel<<<grid, block, 0, stream>>>(
+        qweight, scales, out, N, K, group_size);
+}
+
+// Quantize FP32 residual [N, K] to packed INT4 [N, K/2] + per-group scales [N, K/gs]
+// Symmetric: scale = max(|group|) / 7, values clamped to [-7, 7]
+__global__ void quantize_int4_per_group_kernel(
+    const float* __restrict__ residual,
+    uint8_t* __restrict__ qweight,
+    float* __restrict__ scales,
+    int N, int K, int group_size)
+{
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    if (row >= N) return;
+
+    int num_groups = K / group_size;
+    int col_start = group * group_size;
+    const float* grp = residual + (int64_t)row * K + col_start;
+
+    // Find max abs in group
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = fabsf(grp[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    // Warp reduce
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    // Cross-warp reduce
+    __shared__ float s_max[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) s_max[warp_id] = max_abs;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_max[0] = max_abs;
+    __syncthreads();
+    max_abs = s_max[0];
+
+    float scale = max_abs / 7.0f;
+    if (threadIdx.x == 0)
+        scales[(int64_t)row * num_groups + group] = scale;
+
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Quantize pairs and pack
+    int half_gs = group_size / 2;
+    for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
+        int c0 = col_start + i * 2;
+        int c1 = c0 + 1;
+        float v0 = residual[(int64_t)row * K + c0];
+        float v1 = residual[(int64_t)row * K + c1];
+        int q0 = max(-7, min(7, (int)roundf(v0 * inv_scale)));
+        int q1 = max(-7, min(7, (int)roundf(v1 * inv_scale)));
+        uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+        qweight[(int64_t)row * (K / 2) + (c0 / 2)] = packed;
+    }
+}
+
+void quantize_int4_per_group(const float* residual, uint8_t* qweight, float* scales,
+                              int N, int K, int group_size, cudaStream_t stream) {
+    int num_groups = K / group_size;
+    dim3 grid(N, num_groups);
+    int block = min(256, group_size / 2);
+    if (block < 1) block = 1;
+    quantize_int4_per_group_kernel<<<grid, block, 0, stream>>>(
+        residual, qweight, scales, N, K, group_size);
+}
+
+// INT4+SVD linear forward: FP32 input, INT4 weight -> FP32 output
+// out = x @ R_dequant^T + x @ svd_down @ svd_up^T + bias
+void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
+                          const Tensor* bias, Tensor& out, Tensor& scratch) {
+    assert(x.dtype == DType::FP32);
+    assert(out.dtype == DType::FP32);
+    assert(weight.mode == QuantMode::INT4_SVD);
+
+    int M = (int)x.shape[0];
+    int N = (int)weight.qweight.shape[0];
+    int K = (int)(weight.qweight.shape[1] * 2);
+    int r = weight.svd_rank;
+
+    // Scratch layout (256-byte aligned regions):
+    //   [A] BF16 dequantized weight [N, K]  (Hadamard-rotated residual)
+    //   [B] FP32 temp [M, K]  (for Hadamard rotation of input)
+    //   [C] BF16 input [M, K]  (reused: first x_orig for low-rank, then x_rot for residual)
+    //   [D] BF16 low-rank intermediate [M, r]
+    int64_t offB = (((int64_t)N * K * 2 + 255) & ~255LL);
+    int64_t offC = offB + (((int64_t)M * K * 4 + 255) & ~255LL);
+    int64_t offD = offC + (((int64_t)M * K * 2 + 255) & ~255LL);
+
+    __nv_bfloat16* deq_w    = (__nv_bfloat16*)scratch.data;
+    float*         fp32_tmp = (float*)((char*)scratch.data + offB);
+    __nv_bfloat16* bf16_x   = (__nv_bfloat16*)((char*)scratch.data + offC);
+    __nv_bfloat16* lr_tmp   = (__nv_bfloat16*)((char*)scratch.data + offD);
+
+    float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
+
+    // 1. Convert FP32 input -> BF16 [M, K] (original, non-rotated)
+    fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+
+    // 2. Low-rank down: lr_tmp[M,r] = bf16_x[M,K] @ svd_down[K,r]
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        r, M, K, &alpha,
+        weight.svd_down.data, CUDA_R_16BF, r,
+        bf16_x,               CUDA_R_16BF, K,
+        &beta0,
+        lr_tmp, CUDA_R_16BF, r,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // 3. Low-rank up: out[M,N] = lr_tmp[M,r] @ svd_up[N,r]^T  (beta=0)
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, r, &alpha,
+        weight.svd_up.data, CUDA_R_16BF, r,
+        lr_tmp,             CUDA_R_16BF, r,
+        &beta0,
+        (float*)out.data, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // 4. Hadamard-rotate input for residual path: copy x to FP32 temp, apply FWHT
+    CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+    if (weight.had_block_size > 1) {
+        fwht_inplace(fp32_tmp, M, K, weight.had_block_size);
+    }
+
+    // 5. Convert rotated FP32 -> BF16 (reuse region C)
+    fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
+
+    // 6. Dequantize INT4 packed [N, K/2] -> BF16 [N, K]
+    dequantize_int4_to_bf16(
+        (uint8_t*)weight.qweight.data, (float*)weight.scales4.data,
+        deq_w, N, K, weight.group_size);
+
+    // 7. Residual GEMM: out[M,N] += bf16_x_rot[M,K] @ deq_w[N,K]^T  (beta=1, accumulate)
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        deq_w,  CUDA_R_16BF, K,
+        bf16_x, CUDA_R_16BF, K,
+        &beta1,
+        (float*)out.data, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // 8. Add bias
+    if (bias) {
+        bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
+                      (float*)out.data, M, N);
+    }
+}
+
+// Unified dispatchers
+void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
+                               const Tensor* bias, Tensor& out, Tensor& scratch) {
+    if (weight.mode == QuantMode::INT4_SVD) {
+        linear_forward_int4(x, weight, bias, out, scratch);
+    } else {
+        linear_forward_int8(x, weight, bias, out, scratch);
+    }
+}
+
+void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& weight,
+                                      const Tensor* bias, Tensor& out, Tensor& scratch) {
+    if (weight.mode == QuantMode::INT4_SVD) {
+        // INT4 path: convert BF16→FP32 then call INT4 forward
+        int M = (int)x.shape[0];
+        int K = (int)x.shape[1];
+        Tensor fp32_x = Tensor::alloc({(int64_t)M, (int64_t)K}, DType::FP32);
+        bf16_to_fp32((__nv_bfloat16*)x.data, (float*)fp32_x.data, (int64_t)M * K);
+        linear_forward_int4(fp32_x, weight, bias, out, scratch);
+        fp32_x.free_data();
+    } else {
+        linear_forward_int8_bf16in(x, weight, bias, out, scratch);
+    }
+}
+
+// ================================================================
+// Randomized SVD helpers (CPU)
+// ================================================================
+
+// Modified Gram-Schmidt QR on CPU: Q [N, rp] (in-place on input)
+static void cpu_gram_schmidt(float* Q, int N, int rp) {
+    for (int j = 0; j < rp; j++) {
+        // Normalize column j
+        double norm = 0;
+        for (int i = 0; i < N; i++) {
+            double v = Q[(int64_t)i * rp + j];
+            norm += v * v;
+        }
+        norm = sqrt(norm);
+        if (norm > 1e-12) {
+            float inv = (float)(1.0 / norm);
+            for (int i = 0; i < N; i++) Q[(int64_t)i * rp + j] *= inv;
+        }
+        // Orthogonalize remaining columns against j
+        for (int k = j + 1; k < rp; k++) {
+            double dot = 0;
+            for (int i = 0; i < N; i++)
+                dot += (double)Q[(int64_t)i * rp + j] * Q[(int64_t)i * rp + k];
+            float d = (float)dot;
+            for (int i = 0; i < N; i++)
+                Q[(int64_t)i * rp + k] -= d * Q[(int64_t)i * rp + j];
+        }
+    }
+}
+
+// Jacobi eigendecomposition of symmetric matrix C [n, n] on CPU
+// Returns eigenvalues in D[n] (descending), eigenvectors as columns of C (overwritten)
+static void cpu_jacobi_eig(float* C, float* D, int n, int max_iters = 100) {
+    // Initialize eigenvectors to identity
+    std::vector<float> V(n * n, 0.0f);
+    for (int i = 0; i < n; i++) V[i * n + i] = 1.0f;
+
+    for (int iter = 0; iter < max_iters; iter++) {
+        // Find largest off-diagonal element
+        float max_off = 0;
+        int p = 0, q = 1;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                float v = fabsf(C[i * n + j]);
+                if (v > max_off) { max_off = v; p = i; q = j; }
+            }
+        if (max_off < 1e-10f) break;
+
+        // Compute rotation
+        float app = C[p * n + p], aqq = C[q * n + q], apq = C[p * n + q];
+        float theta = 0.5f * atan2f(2.0f * apq, app - aqq);
+        float c = cosf(theta), s = sinf(theta);
+
+        // Apply rotation to C
+        for (int i = 0; i < n; i++) {
+            float cip = C[i * n + p], ciq = C[i * n + q];
+            C[i * n + p] = c * cip + s * ciq;
+            C[i * n + q] = -s * cip + c * ciq;
+        }
+        for (int j = 0; j < n; j++) {
+            float cpj = C[p * n + j], cqj = C[q * n + j];
+            C[p * n + j] = c * cpj + s * cqj;
+            C[q * n + j] = -s * cpj + c * cqj;
+        }
+        // Apply rotation to V (eigenvectors)
+        for (int i = 0; i < n; i++) {
+            float vip = V[i * n + p], viq = V[i * n + q];
+            V[i * n + p] = c * vip + s * viq;
+            V[i * n + q] = -s * vip + c * viq;
+        }
+    }
+
+    // Extract eigenvalues and sort descending
+    std::vector<int> idx(n);
+    for (int i = 0; i < n; i++) { D[i] = C[i * n + i]; idx[i] = i; }
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return D[a] > D[b]; });
+
+    // Reorder D and V
+    std::vector<float> D_sorted(n);
+    std::vector<float> V_sorted(n * n);
+    for (int j = 0; j < n; j++) {
+        D_sorted[j] = D[idx[j]];
+        for (int i = 0; i < n; i++)
+            V_sorted[i * n + j] = V[i * n + idx[j]];
+    }
+    memcpy(D, D_sorted.data(), n * sizeof(float));
+    memcpy(C, V_sorted.data(), n * n * sizeof(float)); // C now holds sorted eigenvectors
+}
+
+// Quantize BF16 weight to INT4+SVD
+QuantizedWeight quantize_weight_tensor_int4(const Tensor& bf16_weight, int rank, int group_size) {
+    assert(bf16_weight.dtype == DType::BF16);
+    assert(bf16_weight.ndim == 2);
+
+    int N = (int)bf16_weight.shape[0];
+    int K = (int)bf16_weight.shape[1];
+
+    // Adjust group_size for small K
+    int gs = std::min(group_size, K);
+    // Ensure K is divisible by gs
+    while (K % gs != 0 && gs > 2) gs /= 2;
+    assert(K % gs == 0);
+    assert(K % 2 == 0);
+
+    // Clamp rank to min(N, K) - 1
+    int r = std::min(rank, std::min(N, K) - 1);
+    int p = 10; // oversampling
+    int rp = r + p;
+    if (rp > std::min(N, K)) rp = std::min(N, K);
+    if (r > rp) r = rp;
+
+    // Convert BF16 -> FP32 on GPU
+    Tensor fp32_w = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+    bf16_to_fp32((__nv_bfloat16*)bf16_weight.data, (float*)fp32_w.data, (int64_t)N * K);
+
+    // === Randomized SVD (all heavy compute on GPU) ===
+    float alpha_f = 1.0f, beta_f = 0.0f, neg_one = -1.0f, one = 1.0f;
+
+    // 1. Random Omega [K, rp] on CPU, upload
+    std::vector<float> omega_host((int64_t)K * rp);
+    srand(42);
+    for (auto& v : omega_host) v = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    Tensor omega = Tensor::alloc({(int64_t)K, (int64_t)rp}, DType::FP32);
+    omega.from_host(omega_host.data());
+
+    // 2. Y = W @ Omega: [N, rp] on GPU
+    // Row-major: Y_rm[N,rp] = W_rm[N,K] @ Omega_rm[K,rp]
+    // cuBLAS col-major: C[rp,N] = Omega_cm[rp,K] @ W_cm[K,N]
+    Tensor Y = Tensor::alloc({(int64_t)N, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, rp, N, K, &alpha_f,
+        omega.data, CUDA_R_32F, rp, fp32_w.data, CUDA_R_32F, K, &beta_f,
+        Y.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    omega.free_data();
+
+    // 3. GPU Modified Gram-Schmidt QR: Y -> Q in-place, row-major [N, rp]
+    //    Column j of Q_rm has stride rp in memory: elements at Q_data[j], Q_data[j+rp], ...
+    //    cuBLAS Level-1/2 ops work with strided vectors natively.
+    {
+        float* Q_data = (float*)Y.data;
+        Tensor dots_buf = Tensor::alloc({(int64_t)rp}, DType::FP32);
+        float zero_f = 0.0f, neg_one_f = -1.0f, one_f = 1.0f;
+
+        for (int j = 0; j < rp; j++) {
+            // Normalize column j (stride = rp)
+            float norm_sq;
+            CUBLAS_CHECK(cublasSdot(cublas(), N, Q_data + j, rp, Q_data + j, rp, &norm_sq));
+            float inv_norm = (norm_sq > 1e-24f) ? (1.0f / sqrtf(norm_sq)) : 0.0f;
+            CUBLAS_CHECK(cublasSscal(cublas(), N, &inv_norm, Q_data + j, rp));
+
+            if (j + 1 < rp) {
+                int rem = rp - j - 1;
+                // Compute dot products of column j with columns j+1..rp-1
+                // In cuBLAS col-major: the row-major [N,rp] matrix is [rp,N] with lda=rp.
+                // Submatrix at Q_data+(j+1) with dimensions [rem, N] col-major, lda=rp.
+                // CUBLAS_OP_N: A[rem,N] @ x[N] -> y[rem]
+                // x = column j (stride rp), y = dots
+                CUBLAS_CHECK(cublasSgemv(cublas(), CUBLAS_OP_N,
+                    rem, N, &one_f,
+                    Q_data + (j + 1), rp,
+                    Q_data + j, rp,
+                    &zero_f, (float*)dots_buf.data, 1));
+
+                // Rank-1 update: Q[:,j+1:] -= col_j @ dots^T
+                // A[rem,N] -= x[rem] @ y[N]^T
+                CUBLAS_CHECK(cublasSger(cublas(), rem, N, &neg_one_f,
+                    (float*)dots_buf.data, 1,
+                    Q_data + j, rp,
+                    Q_data + (j + 1), rp));
+            }
+        }
+        dots_buf.free_data();
+    }
+    // Y now holds Q in row-major [N, rp]
+
+    // 4. B = Q^T @ W: [rp, K] on GPU
+    // Row-major: B_rm[rp,K]. cuBLAS col-major: B_cm[K,rp] lda=K
+    // C[K,rp] = W_cm[K,N] @ Q_cm^T[N,rp]  (Q_cm is [rp,N] lda=rp, OP_T gives [N,rp])
+    Tensor B = Tensor::alloc({(int64_t)rp, (int64_t)K}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, K, rp, N, &alpha_f,
+        fp32_w.data, CUDA_R_32F, K, Y.data, CUDA_R_32F, rp, &beta_f,
+        B.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+    // 5. C = B @ B^T: [rp, rp] on GPU, then download for tiny eigendecomposition
+    // cuBLAS: C[rp,rp] = B_cm^T[rp,K] @ B_cm[K,rp]
+    Tensor C_gpu = Tensor::alloc({(int64_t)rp, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, rp, rp, K, &alpha_f,
+        B.data, CUDA_R_32F, K, B.data, CUDA_R_32F, K, &beta_f,
+        C_gpu.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Download C (tiny: rp*rp*4 bytes, e.g. 138*138*4 = 76KB)
+    std::vector<float> C_host(rp * rp);
+    C_gpu.to_host(C_host.data());
+    C_gpu.free_data();
+
+    // CPU: Jacobi eigendecomposition of C [rp, rp]
+    std::vector<float> D(rp);
+    cpu_jacobi_eig(C_host.data(), D.data(), rp);
+
+    // Compute sigma_i = sqrt(D_i) for top r
+    std::vector<float> sigma(r);
+    for (int i = 0; i < r; i++)
+        sigma[i] = (D[i] > 0) ? sqrtf(D[i]) : 0.0f;
+
+    // Prepare scaled eigenvector matrices on CPU (tiny: rp*r)
+    // U_inv_sigma[rp, r]: column j = C_host[:, j] * (1/sigma[j])  (for V recovery)
+    // U_sigma[rp, r]:     column j = C_host[:, j] * sigma[j]       (for L_up recovery)
+    std::vector<float> U_inv_sigma(rp * r);
+    std::vector<float> U_sigma(rp * r);
+    for (int j = 0; j < r; j++) {
+        float s = sigma[j];
+        float inv_s = (s > 1e-12f) ? (1.0f / s) : 0.0f;
+        for (int m = 0; m < rp; m++) {
+            U_inv_sigma[m * r + j] = C_host[m * rp + j] * inv_s;
+            U_sigma[m * r + j] = C_host[m * rp + j] * s;
+        }
+    }
+
+    // Upload scaled eigenvectors to GPU (tiny: rp*r*4 bytes each)
+    Tensor U_inv_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    Tensor U_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    U_inv_sigma_gpu.from_host(U_inv_sigma.data());
+    U_sigma_gpu.from_host(U_sigma.data());
+
+    // 6. V (L_down) [K, r] = B^T @ U_inv_sigma on GPU
+    // Row-major result [K,r] = col-major [r,K] lda=r
+    // cuBLAS: C[r,K] = U_inv_sigma_cm[r,rp] @ B_cm^T[rp,K]
+    //   U_inv_sigma_rm [rp,r] = U_inv_sigma_cm [r,rp] with lda=r → OP_N = [r,rp]...
+    //   Actually: U_inv_sigma_cm^T = U_inv_sigma_rm. So OP_N on U_inv_sigma_cm = U_inv_sigma_rm^T = [r,rp].
+    //   B_cm [K,rp] lda=K → OP_T = [rp,K].
+    //   C[r,K] = [r,rp] @ [rp,K] = OK
+    Tensor L_down_gpu = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, r, K, rp, &alpha_f,
+        U_inv_sigma_gpu.data, CUDA_R_32F, r, B.data, CUDA_R_32F, K, &beta_f,
+        L_down_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_inv_sigma_gpu.free_data();
+    B.free_data();
+
+    // 7. L_up [N, r] = Q @ U_sigma on GPU
+    // Row-major [N,r] = col-major [r,N] lda=r
+    // cuBLAS: C[r,N] = U_sigma_cm[r,rp] @ Q_cm[rp,N]
+    //   U_sigma_cm^T = U_sigma_rm → OP_N on U_sigma_cm = [r,rp]
+    //   Q_cm [rp,N] lda=rp → OP_N = [rp,N]
+    Tensor L_up_gpu = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, r, N, rp, &alpha_f,
+        U_sigma_gpu.data, CUDA_R_32F, r, Y.data, CUDA_R_32F, rp, &beta_f,
+        L_up_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_sigma_gpu.free_data();
+    Y.free_data(); // Q no longer needed
+
+    // 8. Residual R = W - L_up @ L_down^T on GPU
+    // fp32_w[N,K] += -1 * L_up[N,r] @ L_down^T[r,K]
+    // cuBLAS: C[K,N] += -1 * L_down_cm^T[K,r] @ L_up_cm[r,N]
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, K, N, r, &neg_one,
+        L_down_gpu.data, CUDA_R_32F, r, L_up_gpu.data, CUDA_R_32F, r, &one,
+        fp32_w.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // fp32_w now contains the residual R[N, K]
+
+    // 7a. Apply Hadamard rotation to residual columns (smooths outliers for INT4)
+    int hbs = hadamard_block_size(K);
+    if (hbs > 1) {
+        fwht_inplace((float*)fp32_w.data, N, K, hbs);
+    }
+
+    // 7b. INT4 per-group quantize R_rotated
+    Tensor qw_data = Tensor::alloc({(int64_t)N, (int64_t)(K / 2)}, DType::UINT8);
+    int num_groups = K / gs;
+    Tensor qw_scales = Tensor::alloc({(int64_t)N, (int64_t)num_groups}, DType::FP32);
+
+    quantize_int4_per_group((float*)fp32_w.data, (uint8_t*)qw_data.data,
+                             (float*)qw_scales.data, N, K, gs);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    fp32_w.free_data();
+
+    // 8. Convert L_up, L_down to BF16
+    Tensor svd_up_bf16 = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::BF16);
+    Tensor svd_down_bf16 = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::BF16);
+    fp32_to_bf16((float*)L_up_gpu.data, (__nv_bfloat16*)svd_up_bf16.data, (int64_t)N * r);
+    fp32_to_bf16((float*)L_down_gpu.data, (__nv_bfloat16*)svd_down_bf16.data, (int64_t)K * r);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    L_up_gpu.free_data();
+    L_down_gpu.free_data();
+
+    // 9. Package
+    QuantizedWeight qw;
+    qw.mode = QuantMode::INT4_SVD;
+    qw.qweight = std::move(qw_data);
+    qw.scales4 = std::move(qw_scales);
+    qw.svd_up = std::move(svd_up_bf16);
+    qw.svd_down = std::move(svd_down_bf16);
+    qw.group_size = gs;
+    qw.svd_rank = r;
+    qw.had_block_size = hbs;
+    return qw;
+}

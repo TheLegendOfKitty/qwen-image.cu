@@ -76,26 +76,43 @@ struct TransformerWeights {
     std::vector<Block> blocks;
 
     void load(const SafeTensorsLoader& loader) {
-        // Detect if weights are pre-quantized
-        bool pre_quantized = loader.has_tensor("img_in.weight") &&
-                             loader.get_info("img_in.weight").dtype == DType::INT8;
+        // Detect quantization mode
+        bool pre_quantized_int4 = loader.has_tensor("img_in.weight.__svd_up__");
+        bool pre_quantized_int8 = !pre_quantized_int4 &&
+                                   loader.has_tensor("img_in.weight") &&
+                                   loader.get_info("img_in.weight").dtype == DType::INT8;
         fprintf(stderr, "Loading transformer weights (%s)...\n",
-                pre_quantized ? "pre-quantized INT8" : "quantizing BF16→INT8");
+                pre_quantized_int4 ? "pre-quantized INT4+SVD" :
+                pre_quantized_int8 ? "pre-quantized INT8" : "quantizing BF16->INT8");
 
-        // Helper: load weight as QuantizedWeight.
-        // If the tensor is already INT8 (pre-quantized), load directly.
-        // Otherwise, load BF16 and quantize at load time.
+        // Helper: load weight as QuantizedWeight (auto-detects INT4/INT8/BF16)
         auto load_q = [&](const std::string& name) -> QuantizedWeight {
-            if (loader.has_tensor(name) && loader.get_info(name).dtype == DType::INT8) {
-                // Pre-quantized path
+            // INT4+SVD path
+            if (loader.has_tensor(name + ".__svd_up__")) {
                 QuantizedWeight qw;
+                qw.mode = QuantMode::INT4_SVD;
+                qw.qweight = loader.load_tensor(name + ".__qweight__");
+                qw.scales4 = loader.load_tensor(name + ".__scales4__");
+                qw.svd_up = loader.load_tensor(name + ".__svd_up__");
+                qw.svd_down = loader.load_tensor(name + ".__svd_down__");
+                qw.svd_rank = (int)qw.svd_up.shape[1];
+                int K_packed = (int)qw.qweight.shape[1];
+                int num_groups = (int)qw.scales4.shape[1];
+                qw.group_size = (K_packed * 2) / num_groups;
+                qw.had_block_size = hadamard_block_size(K_packed * 2);
+                return qw;
+            }
+            // Pre-quantized INT8 path
+            if (loader.has_tensor(name) && loader.get_info(name).dtype == DType::INT8) {
+                QuantizedWeight qw;
+                qw.mode = QuantMode::INT8_HADAMARD;
                 qw.data = loader.load_tensor(name);
                 qw.scales = loader.load_tensor(name + ".__scales__");
                 int K = (int)qw.data.shape[1];
                 qw.had_block_size = hadamard_block_size(K);
                 return qw;
             }
-            // Fallback: quantize at load time
+            // Fallback: quantize BF16 at load time (INT8)
             Tensor bf16 = loader.load_tensor(name);
             QuantizedWeight qw = quantize_weight_tensor(bf16);
             bf16.free_data();

@@ -175,25 +175,42 @@ void linear_forward(const Tensor& x, const Tensor& weight, const Tensor* bias, T
 void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out);
 
 // ================================================================
-// INT8 QUANTIZATION SUPPORT
-// Per-channel symmetric weight quantization + per-token dynamic
-// activation quantization with INT8 tensor core GEMMs.
+// QUANTIZATION SUPPORT
+// INT8: Per-channel symmetric + Hadamard rotation + INT8 tensor core GEMMs
+// INT4: SVDQuant — per-group INT4 residual + BF16 low-rank correction
 // ================================================================
 
-// Quantized weight: INT8 data + FP32 per-output-channel scales
-// Weights are Hadamard-rotated before quantization for better quality.
-struct QuantizedWeight {
-    Tensor data;       // [N, K] INT8
-    Tensor scales;     // [N] FP32
-    int had_block_size; // Hadamard block size used for rotation (power of 2)
+enum class QuantMode { INT8_HADAMARD, INT4_SVD };
 
-    QuantizedWeight() : had_block_size(0) {}
+// Quantized weight supporting both INT8 and INT4+SVD modes.
+// Unused fields stay null (no GPU memory allocated).
+struct QuantizedWeight {
+    QuantMode mode = QuantMode::INT8_HADAMARD;
+
+    // --- INT8 fields ---
+    Tensor data;            // [N, K] INT8
+    Tensor scales;          // [N] FP32
+    int had_block_size;     // Hadamard block size (power of 2)
+
+    // --- INT4+SVD fields ---
+    Tensor qweight;         // [N, K/2] UINT8 (packed INT4, 2 per byte)
+    Tensor scales4;         // [N, K/group_size] FP32
+    Tensor svd_up;          // [N, r] BF16 (L_up = U_r * S_r)
+    Tensor svd_down;        // [K, r] BF16 (L_down = V_r)
+    int group_size;         // INT4 quantization group size
+    int svd_rank;           // SVD rank r
+
+    QuantizedWeight() : had_block_size(0), group_size(128), svd_rank(0) {}
     QuantizedWeight(QuantizedWeight&&) = default;
     QuantizedWeight& operator=(QuantizedWeight&&) = default;
 
     void free_data() {
         data.free_data();
         scales.free_data();
+        qweight.free_data();
+        scales4.free_data();
+        svd_up.free_data();
+        svd_down.free_data();
     }
 };
 
@@ -247,6 +264,43 @@ inline int64_t int8_scratch_bytes(int M, int K, int N) {
     // FP32 per-token scales
     int64_t scales = (((int64_t)M * 4 + 255) & ~255LL);
     return regionA + act + scales;
+}
+
+// ================================================================
+// INT4 SVDQuant SUPPORT
+// Per-group symmetric INT4 weight quantization with SVD low-rank
+// correction. W4A16: dequant INT4→BF16, BF16 GEMM + low-rank.
+// ================================================================
+
+// Dequantize packed INT4 → BF16
+void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
+                              __nv_bfloat16* out, int N, int K, int group_size,
+                              cudaStream_t stream = 0);
+
+// Quantize FP32 residual → packed INT4 + per-group scales
+void quantize_int4_per_group(const float* residual, uint8_t* qweight, float* scales,
+                              int N, int K, int group_size, cudaStream_t stream = 0);
+
+// INT4+SVD linear: FP32 input × INT4 weight → FP32 output
+void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
+                          const Tensor* bias, Tensor& out, Tensor& scratch);
+
+// Unified dispatchers: pick INT8 or INT4 based on weight.mode
+void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
+                               const Tensor* bias, Tensor& out, Tensor& scratch);
+void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& weight,
+                                      const Tensor* bias, Tensor& out, Tensor& scratch);
+
+// Quantize a BF16 weight to INT4+SVD (offline tool)
+QuantizedWeight quantize_weight_tensor_int4(const Tensor& bf16_weight, int rank, int group_size);
+
+// Scratch bytes for INT4 forward
+inline int64_t int4_scratch_bytes(int M, int K, int N, int svd_rank) {
+    int64_t deq_weight = (((int64_t)N * K * 2 + 255) & ~255LL);  // BF16 dequant weight [N,K]
+    int64_t fp32_temp  = (((int64_t)M * K * 4 + 255) & ~255LL);  // FP32 temp for Hadamard [M,K]
+    int64_t bf16_x     = (((int64_t)M * K * 2 + 255) & ~255LL);  // BF16 input [M,K]
+    int64_t lr_inter   = (((int64_t)M * svd_rank * 2 + 255) & ~255LL); // BF16 low-rank tmp [M,r]
+    return deq_weight + fp32_temp + bf16_x + lr_inter;
 }
 
 // ================================================================

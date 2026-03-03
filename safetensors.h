@@ -86,6 +86,8 @@ public:
                 fprintf(stderr, "Warning: tensor '%s' is F16, treating as BF16\n", key.c_str());
             } else if (dtype_str == "I8" || dtype_str == "int8") {
                 info.dtype = DType::INT8;
+            } else if (dtype_str == "U8" || dtype_str == "uint8") {
+                info.dtype = DType::UINT8;
             } else {
                 fprintf(stderr, "Unknown dtype '%s' for tensor '%s'\n", dtype_str.c_str(), key.c_str());
                 continue;
