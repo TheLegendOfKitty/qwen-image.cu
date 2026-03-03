@@ -175,19 +175,16 @@ int main(int argc, char** argv) {
     quantize_weight("time_text_embed.timestep_embedder.linear_2.weight");
     passthrough("time_text_embed.timestep_embedder.linear_2.bias");
 
-    // --- Input projections ---
-    fprintf(stderr, "Quantizing input projections...\n");
+    // --- Input/output projections (kept BF16 — sensitive boundary layers) ---
+    fprintf(stderr, "Passing through input/output projections as BF16...\n");
     passthrough("txt_norm.weight");
-    quantize_weight("img_in.weight");
+    passthrough("img_in.weight");
     passthrough("img_in.bias");
-    quantize_weight("txt_in.weight");
+    passthrough("txt_in.weight");
     passthrough("txt_in.bias");
-
-    // --- Output ---
-    fprintf(stderr, "Quantizing output layers...\n");
-    quantize_weight("norm_out.linear.weight");
+    passthrough("norm_out.linear.weight");
     passthrough("norm_out.linear.bias");
-    quantize_weight("proj_out.weight");
+    passthrough("proj_out.weight");
     passthrough("proj_out.bias");
 
     // --- 60 transformer blocks ---

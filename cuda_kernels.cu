@@ -2558,10 +2558,71 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     }
 }
 
+// BF16 native forward: FP32 input, BF16 weight → FP32 output
+static void linear_forward_bf16(const Tensor& x, const QuantizedWeight& weight,
+                                 const Tensor* bias, Tensor& out, Tensor& scratch) {
+    assert(x.dtype == DType::FP32);
+    assert(out.dtype == DType::FP32);
+    assert(weight.data.dtype == DType::BF16);
+
+    int M = (int)x.shape[0];
+    int K = (int)x.shape[1];
+    int N = (int)weight.data.shape[0];
+
+    // Convert FP32 input → BF16 in scratch
+    __nv_bfloat16* bf16_x = (__nv_bfloat16*)scratch.data;
+    fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+
+    // BF16 × BF16 → FP32 GEMM
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        weight.data.data, CUDA_R_16BF, K,
+        bf16_x,           CUDA_R_16BF, K,
+        &beta,
+        (float*)out.data, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    if (bias) {
+        bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
+                      (float*)out.data, M, N);
+    }
+}
+
+// BF16 native forward: BF16 input, BF16 weight → FP32 output
+static void linear_forward_bf16_bf16in(const Tensor& x, const QuantizedWeight& weight,
+                                        const Tensor* bias, Tensor& out) {
+    assert(x.dtype == DType::BF16);
+    assert(out.dtype == DType::FP32);
+    assert(weight.data.dtype == DType::BF16);
+
+    int M = (int)x.shape[0];
+    int K = (int)x.shape[1];
+    int N = (int)weight.data.shape[0];
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        weight.data.data, CUDA_R_16BF, K,
+        x.data,           CUDA_R_16BF, K,
+        &beta,
+        (float*)out.data, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    if (bias) {
+        bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
+                      (float*)out.data, M, N);
+    }
+}
+
 // Unified dispatchers
 void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
                                const Tensor* bias, Tensor& out, Tensor& scratch) {
-    if (weight.mode == QuantMode::INT4_SVD) {
+    if (weight.mode == QuantMode::BF16) {
+        linear_forward_bf16(x, weight, bias, out, scratch);
+    } else if (weight.mode == QuantMode::INT4_SVD) {
         linear_forward_int4(x, weight, bias, out, scratch);
     } else {
         linear_forward_int8(x, weight, bias, out, scratch);
@@ -2570,8 +2631,9 @@ void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
 
 void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& weight,
                                       const Tensor* bias, Tensor& out, Tensor& scratch) {
-    if (weight.mode == QuantMode::INT4_SVD) {
-        // INT4 path: convert BF16→FP32 then call INT4 forward
+    if (weight.mode == QuantMode::BF16) {
+        linear_forward_bf16_bf16in(x, weight, bias, out);
+    } else if (weight.mode == QuantMode::INT4_SVD) {
         int M = (int)x.shape[0];
         int K = (int)x.shape[1];
         Tensor fp32_x = Tensor::alloc({(int64_t)M, (int64_t)K}, DType::FP32);

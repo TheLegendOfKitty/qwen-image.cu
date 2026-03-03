@@ -180,7 +180,7 @@ void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor*
 // INT4: SVDQuant — per-group INT4 residual + BF16 low-rank correction
 // ================================================================
 
-enum class QuantMode { INT8_HADAMARD, INT4_SVD };
+enum class QuantMode { INT8_HADAMARD, INT4_SVD, BF16 };
 
 // Quantized weight supporting both INT8 and INT4+SVD modes.
 // Unused fields stay null (no GPU memory allocated).

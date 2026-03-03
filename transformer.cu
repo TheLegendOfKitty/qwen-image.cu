@@ -130,8 +130,9 @@ Tensor transformer_forward(const TransformerWeights& w,
     }
 
     // Scratch for quantized GEMM. Mode-aware: INT8 or INT4+SVD.
-    QuantMode qmode = w.img_in_weight.mode;
-    int svd_rank = (qmode == QuantMode::INT4_SVD) ? w.img_in_weight.svd_rank : 0;
+    // Use a block-level weight to detect mode (boundary layers may be BF16 in mixed-precision).
+    QuantMode qmode = w.blocks[0].to_q_weight.mode;
+    int svd_rank = (qmode == QuantMode::INT4_SVD) ? w.blocks[0].to_q_weight.svd_rank : 0;
 
     int64_t max_scratch_bytes = 0;
     auto grow_scratch = [&](int M, int K, int N) {

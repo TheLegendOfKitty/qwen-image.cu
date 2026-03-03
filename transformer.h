@@ -76,11 +76,11 @@ struct TransformerWeights {
     std::vector<Block> blocks;
 
     void load(const SafeTensorsLoader& loader) {
-        // Detect quantization mode
-        bool pre_quantized_int4 = loader.has_tensor("img_in.weight.__svd_up__");
+        // Detect quantization mode (check a block-level weight, not boundary layers which may be BF16)
+        bool pre_quantized_int4 = loader.has_tensor("transformer_blocks.0.attn.to_q.weight.__svd_up__");
         bool pre_quantized_int8 = !pre_quantized_int4 &&
-                                   loader.has_tensor("img_in.weight") &&
-                                   loader.get_info("img_in.weight").dtype == DType::INT8;
+                                   loader.has_tensor("transformer_blocks.0.attn.to_q.weight") &&
+                                   loader.get_info("transformer_blocks.0.attn.to_q.weight").dtype == DType::INT8;
         fprintf(stderr, "Loading transformer weights (%s)...\n",
                 pre_quantized_int4 ? "pre-quantized INT4+SVD" :
                 pre_quantized_int8 ? "pre-quantized INT8" : "quantizing BF16->INT8");
@@ -110,6 +110,13 @@ struct TransformerWeights {
                 qw.scales = loader.load_tensor(name + ".__scales__");
                 int K = (int)qw.data.shape[1];
                 qw.had_block_size = hadamard_block_size(K);
+                return qw;
+            }
+            // BF16 native path (sensitive layers kept unquantized)
+            if (loader.has_tensor(name) && loader.get_info(name).dtype == DType::BF16) {
+                QuantizedWeight qw;
+                qw.mode = QuantMode::BF16;
+                qw.data = loader.load_tensor(name);
                 return qw;
             }
             // Fallback: quantize BF16 at load time (INT8)
