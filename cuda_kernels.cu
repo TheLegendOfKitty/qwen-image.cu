@@ -3162,16 +3162,16 @@ static void gptq_quantize_nf4(
             &beta, H_gpu, K));
     }
 
-    // 2. Dampen diagonal: H[i,i] += 0.01 * mean(diag(H))
-    //    Additive damping ensures rank-deficient directions get meaningful regularization.
+    // 2. Dampen diagonal: H[i,i] += 0.01 * mean_nonzero_eigenvalue
+    //    H has rank min(M,K), so divide trace by min(M,K) not K to get the
+    //    mean non-zero eigenvalue. This prevents under-dampening when M << K.
     {
         std::vector<float> H_host((int64_t)K * K);
         CUDA_CHECK(cudaMemcpy(H_host.data(), H_gpu, (int64_t)K * K * sizeof(float), cudaMemcpyDeviceToHost));
-        double diag_mean = 0.0;
+        double diag_sum = 0.0;
         for (int i = 0; i < K; i++)
-            diag_mean += H_host[(int64_t)i * K + i];
-        diag_mean /= K;
-        float damp = (float)(0.01 * diag_mean);
+            diag_sum += H_host[(int64_t)i * K + i];
+        float damp = (float)(0.01 * diag_sum / std::min(M_total, K));
         for (int i = 0; i < K; i++)
             H_host[(int64_t)i * K + i] += damp;
         CUDA_CHECK(cudaMemcpy(H_gpu, H_host.data(), (int64_t)K * K * sizeof(float), cudaMemcpyHostToDevice));
