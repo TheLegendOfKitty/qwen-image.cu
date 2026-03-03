@@ -186,7 +186,7 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
         grow_weight_scratch(l.down_proj_weight);
     }
 
-    Tensor weight_fp32_scratch = Tensor::alloc({max_weight_numel}, DType::FP32);
+    Tensor gemm_scratch = Tensor::alloc({max_weight_numel}, DType::FP32);
 
     // Allocate working buffers
     Tensor normed = Tensor::alloc({seq_len, hidden_size}, DType::FP32);
@@ -232,15 +232,15 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
         {
             Tensor q_2d = q_buf.view({seq_len, n_heads * head_dim});
             linear_forward_fp32in_bf16w_fp32out(normed, l.q_proj_weight, &l.q_proj_bias,
-                                                q_2d, weight_fp32_scratch);
+                                                q_2d, gemm_scratch);
 
             Tensor k_2d = k_buf.view({seq_len, n_kv_heads * head_dim});
             linear_forward_fp32in_bf16w_fp32out(normed, l.k_proj_weight, &l.k_proj_bias,
-                                                k_2d, weight_fp32_scratch);
+                                                k_2d, gemm_scratch);
 
             Tensor v_2d = v_buf.view({seq_len, n_kv_heads * head_dim});
             linear_forward_fp32in_bf16w_fp32out(normed, l.v_proj_weight, &l.v_proj_bias,
-                                                v_2d, weight_fp32_scratch);
+                                                v_2d, gemm_scratch);
         }
 
         if (dump_debug && layer == 0) {
@@ -296,7 +296,7 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
                 dump_f32(attn_out.data, (int64_t)seq_len * hidden_size, "debug_dumps/cuda_post_attn_out.bin");
             }
             linear_forward_fp32in_bf16w_fp32out(attn_out, l.o_proj_weight, nullptr,
-                                                proj_out, weight_fp32_scratch);
+                                                proj_out, gemm_scratch);
         }
 
         if (dump_debug && layer == 0) {
@@ -319,9 +319,9 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
         // 9. SwiGLU MLP: gate = silu(gate_proj(x)) * up_proj(x), out = down_proj(gate)
         {
             linear_forward_fp32in_bf16w_fp32out(normed, l.gate_proj_weight, nullptr,
-                                                gate_buf, weight_fp32_scratch);
+                                                gate_buf, gemm_scratch);
             linear_forward_fp32in_bf16w_fp32out(normed, l.up_proj_weight, nullptr,
-                                                up_buf, weight_fp32_scratch);
+                                                up_buf, gemm_scratch);
 
             silu_fp32((float*)gate_buf.data, (float*)gate_buf.data,
                       (int64_t)seq_len * intermediate_size);
@@ -329,7 +329,7 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
                              (float*)gate_buf.data, (int64_t)seq_len * intermediate_size);
 
             linear_forward_fp32in_bf16w_fp32out(gate_buf, l.down_proj_weight, nullptr,
-                                                mlp_out, weight_fp32_scratch);
+                                                mlp_out, gemm_scratch);
         }
 
         // 10. Residual add
@@ -355,7 +355,7 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
     hidden.free_data();
     cos_gpu.free_data();
     sin_gpu.free_data();
-    weight_fp32_scratch.free_data();
+    gemm_scratch.free_data();
     normed.free_data();
     q_buf.free_data();
     k_buf.free_data();

@@ -895,7 +895,7 @@ void conv2d_forward(const __nv_bfloat16* input, const __nv_bfloat16* weight, con
             weight, CUDA_R_16BF, K_gemm,
             &beta,
             out_n, CUDA_R_16BF, N_gemm,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
         // Add bias: out[c, h, w] += bias[c]
         if (bias) {
@@ -1005,7 +1005,7 @@ void causal_conv3d_forward(const __nv_bfloat16* input, const __nv_bfloat16* weig
         weight, CUDA_R_16BF, K_gemm,
         &beta,
         output, CUDA_R_16BF, N_gemm,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // Add bias
     if (bias) {
@@ -1125,7 +1125,7 @@ void attention_forward(const __nv_bfloat16* q, const __nv_bfloat16* k, const __n
         scores, CUDA_R_32F, S, (long long)S * S, // C = scores, ldc=S, stride
         BH,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // Apply causal mask if requested: set scores[bh][q][k] = -inf when k > q
     if (causal) {
@@ -1156,7 +1156,7 @@ void attention_forward(const __nv_bfloat16* q, const __nv_bfloat16* k, const __n
         out, CUDA_R_16BF, D, (long long)S * D,         // C = out
         BH,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     CUDA_CHECK(cudaFree(scores));
     CUDA_CHECK(cudaFree(scores_bf16));
@@ -1387,7 +1387,7 @@ void linear_forward(const Tensor& x, const Tensor& weight, const Tensor* bias, T
         &beta_val,
         out.data, CUDA_R_16BF, N,     // C = out, ldc = N
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (bias) {
         bias_add((__nv_bfloat16*)out.data, (__nv_bfloat16*)bias->data,
@@ -1415,7 +1415,7 @@ void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor*
         out.data, CUDA_R_16BF, N, (long long)M * N, // out batch stride
         B,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (bias) {
         bias_add((__nv_bfloat16*)out.data, (__nv_bfloat16*)bias->data,
@@ -1449,7 +1449,9 @@ void bias_add_fp32(const float* x, const __nv_bfloat16* bias, float* out,
     bias_add_fp32_kernel<<<grid, block, 0, stream>>>(x, bias, out, outer, dim);
 }
 
-void linear_forward_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out) {
+void linear_forward_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out,
+                            Tensor* gemm_scratch) {
+    // Match ggml: BF16 x BF16 -> BF16 GEMM, then BF16 -> FP32 conversion
     // x: [M, K] BF16, weight: [N, K] BF16, out: [M, N] FP32
     int M = (int)x.shape[0];
     int K = (int)x.shape[1];
@@ -1461,17 +1463,37 @@ void linear_forward_fp32out(const Tensor& x, const Tensor& weight, const Tensor*
 
     float alpha = 1.0f, beta_val = 0.0f;
 
-    CUBLAS_CHECK(cublasGemmEx(
-        cublas(),
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        weight.data, CUDA_R_16BF, K,
-        x.data, CUDA_R_16BF, K,
-        &beta_val,
-        out.data, CUDA_R_32F, N,  // FP32 output
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+    if (gemm_scratch) {
+        // Match ggml: BF16 output then convert to FP32
+        __nv_bfloat16* output_bf16 = (__nv_bfloat16*)gemm_scratch->data;
+
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            weight.data, CUDA_R_16BF, K,
+            x.data, CUDA_R_16BF, K,
+            &beta_val,
+            output_bf16, CUDA_R_16BF, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+        bf16_to_fp32(output_bf16, (float*)out.data, (int64_t)M * N);
+    } else {
+        // Fallback: direct FP32 output
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            weight.data, CUDA_R_16BF, K,
+            x.data, CUDA_R_16BF, K,
+            &beta_val,
+            out.data, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
 
     if (bias) {
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
@@ -1499,7 +1521,7 @@ void linear_forward_batched_fp32out(const Tensor& x, const Tensor& weight, const
         out.data, CUDA_R_32F, N, (long long)M * N,  // FP32 output
         B,
         CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (bias) {
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
@@ -1508,8 +1530,12 @@ void linear_forward_batched_fp32out(const Tensor& x, const Tensor& weight, const
 }
 
 void linear_forward_fp32in_bf16w_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias,
-                                         Tensor& out, Tensor& weight_scratch) {
-    // x: [M, K] FP32, weight: [N, K] BF16, out: [M, N] FP32
+                                         Tensor& out, Tensor& gemm_scratch) {
+    // Match ggml's BF16 GEMM path exactly:
+    // 1. Convert FP32 input -> BF16
+    // 2. BF16 x BF16 -> BF16 GEMM (CUBLAS_COMPUTE_32F + TENSOR_OP)
+    // 3. Convert BF16 output -> FP32
+    // 4. Add bias in FP32 (separate op, matching ggml)
     int M = (int)x.shape[0];
     int K = (int)x.shape[1];
     int N = (int)weight.shape[0];
@@ -1519,11 +1545,13 @@ void linear_forward_fp32in_bf16w_fp32out(const Tensor& x, const Tensor& weight, 
     assert(out.dtype == DType::FP32);
     assert(weight.shape[1] == K);
     assert(out.shape[0] == M && out.shape[1] == N);
-    assert(weight_scratch.dtype == DType::FP32);
-    assert(weight_scratch.numel() >= (int64_t)N * K);
 
-    // Expand BF16 weights into FP32 scratch so GEMM can stay fully FP32.
-    bf16_to_fp32((const __nv_bfloat16*)weight.data, (float*)weight_scratch.data, (int64_t)N * K);
+    // Partition scratch into BF16 input and BF16 output regions.
+    // Need (M*K + M*N) * 2 bytes; scratch has max_weight_numel * 4 bytes which is always larger.
+    __nv_bfloat16* input_bf16  = (__nv_bfloat16*)gemm_scratch.data;
+    __nv_bfloat16* output_bf16 = input_bf16 + (int64_t)M * K;
+
+    fp32_to_bf16((const float*)x.data, input_bf16, (int64_t)M * K);
 
     float alpha = 1.0f, beta_val = 0.0f;
 
@@ -1532,12 +1560,14 @@ void linear_forward_fp32in_bf16w_fp32out(const Tensor& x, const Tensor& weight, 
         CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha,
-        weight_scratch.data, CUDA_R_32F, K,
-        x.data, CUDA_R_32F, K,
+        weight.data, CUDA_R_16BF, K,
+        input_bf16,  CUDA_R_16BF, K,
         &beta_val,
-        out.data, CUDA_R_32F, N,
-        CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT));
+        output_bf16, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    bf16_to_fp32(output_bf16, (float*)out.data, (int64_t)M * N);
 
     if (bias) {
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
@@ -1834,7 +1864,7 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
         scores, CUDA_R_32F, S, (long long)S * S,
         BH,
         CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (causal) apply_causal_mask(scores, BH, S, stream);
 
@@ -1852,10 +1882,10 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
         v, CUDA_R_32F, D, (long long)S * D,
         scores, CUDA_R_32F, S, (long long)S * S,
         &beta_val,
-        out, CUDA_R_32F, D, (long long)S * D,  // FP32 output
+        out, CUDA_R_32F, D, (long long)S * D,
         BH,
         CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     CUDA_CHECK(cudaFree(q_fp16));
     CUDA_CHECK(cudaFree(k_fp16));
     CUDA_CHECK(cudaFree(scores));
@@ -1882,7 +1912,7 @@ void attention_forward_fp32(const float* q, const float* k, const float* v,
         scores, CUDA_R_32F, S, (long long)S * S,
         BH,
         CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (causal) apply_causal_mask(scores, BH, S, stream);
 
@@ -1902,7 +1932,7 @@ void attention_forward_fp32(const float* q, const float* k, const float* v,
         out, CUDA_R_32F, D, (long long)S * D,
         BH,
         CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT));
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     CUDA_CHECK(cudaFree(scores));
 }

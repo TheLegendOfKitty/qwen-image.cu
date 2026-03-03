@@ -178,14 +178,16 @@ void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor*
 // Keep activations in FP32 between GEMMs to match ggml precision.
 // ================================================================
 
-// Linear with FP32 output: BF16 input × BF16 weight → FP32 output
-void linear_forward_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out);
+// Linear with FP32 output: BF16 input × BF16 weight → BF16 GEMM → FP32 output
+// If gemm_scratch is provided, matches ggml's BF16 output + convert pattern.
+void linear_forward_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out,
+                            Tensor* gemm_scratch = nullptr);
 void linear_forward_batched_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias, Tensor& out);
 
-// Linear with FP32 activations and FP32 output. BF16 weights are expanded into
-// the provided FP32 scratch buffer before GEMM.
+// Linear with FP32 input/output, BF16 weights. Matches ggml's BF16 GEMM path:
+// FP32 input → BF16, BF16×BF16→BF16 GEMM, BF16 → FP32 output.
 void linear_forward_fp32in_bf16w_fp32out(const Tensor& x, const Tensor& weight, const Tensor* bias,
-                                         Tensor& out, Tensor& weight_scratch);
+                                         Tensor& out, Tensor& gemm_scratch);
 
 // Bias add: FP32 x + BF16 bias → FP32 out
 void bias_add_fp32(const float* x, const __nv_bfloat16* bias, float* out,
