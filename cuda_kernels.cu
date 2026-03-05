@@ -2600,6 +2600,24 @@ void fwht_quantize_bf16(const __nv_bfloat16* input, int8_t* output, float* scale
         input, output, scales, M, K, had_block_size);
 }
 
+void quantize_activation_int8_hadamard_fp32(const float* input, int8_t* output, float* scales,
+                                            int M, int K, int had_block_size, cudaStream_t stream) {
+    if (had_block_size > 1) {
+        fwht_quantize_fp32(input, output, scales, M, K, had_block_size, stream);
+    } else {
+        quantize_activation_per_token_fp32(input, output, scales, M, K, stream);
+    }
+}
+
+void quantize_activation_int8_hadamard_bf16(const __nv_bfloat16* input, int8_t* output, float* scales,
+                                            int M, int K, int had_block_size, cudaStream_t stream) {
+    if (had_block_size > 1) {
+        fwht_quantize_bf16(input, output, scales, M, K, had_block_size, stream);
+    } else {
+        quantize_activation_per_token_bf16(input, output, scales, M, K, stream);
+    }
+}
+
 // Dequantize INT32 GEMM output + add bias
 // out[i,j] = gemm_out[i,j] * act_scales[i] * w_scales[j] + bias[j]
 __global__ void dequantize_and_bias_kernel(
@@ -2703,6 +2721,47 @@ void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // Step 4: Dequantize and add bias (optionally fused with GELU)
+    auto* bias_ptr = bias ? (__nv_bfloat16*)bias->data : nullptr;
+    if (apply_gelu) {
+        dequantize_bias_gelu(gemm_out, act_scales, (float*)weight.scales.data,
+                             bias_ptr, (float*)out.data, M, N);
+    } else {
+        dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
+                            bias_ptr, (float*)out.data, M, N);
+    }
+}
+
+void linear_forward_int8_prequantized(const int8_t* act_int8, const float* act_scales,
+                                      int M, int K, const QuantizedWeight& weight,
+                                      const Tensor* bias, Tensor& out, Tensor& scratch,
+                                      bool apply_gelu) {
+    int N = (int)weight.data.shape[0];
+
+    assert(weight.mode == QuantMode::INT8_HADAMARD);
+    assert(weight.data.dtype == DType::INT8);
+    assert(weight.scales.dtype == DType::FP32);
+    assert(weight.data.shape[1] == K);
+    assert(out.dtype == DType::FP32);
+    assert(out.shape[0] == M && out.shape[1] == N);
+
+    // Region A must fit INT32 GEMM output [M, N].
+    int64_t regionA_size = (((int64_t)std::max((int64_t)M * K, (int64_t)M * N) * 4 + 255) & ~255LL);
+    assert(scratch.nbytes() >= (size_t)regionA_size);
+
+    int32_t* gemm_out = (int32_t*)scratch.data;
+    int32_t alpha_i = 1, beta_i = 0;
+    CUBLAS_CHECK(cublasGemmEx(
+        cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha_i,
+        weight.data.data, CUDA_R_8I, K,
+        act_int8,         CUDA_R_8I, K,
+        &beta_i,
+        gemm_out,         CUDA_R_32I, N,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
     auto* bias_ptr = bias ? (__nv_bfloat16*)bias->data : nullptr;
     if (apply_gelu) {
         dequantize_bias_gelu(gemm_out, act_scales, (float*)weight.scales.data,

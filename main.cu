@@ -557,6 +557,13 @@ int main(int argc, char** argv) {
     if (!cfg.verbose && !cal_ptr) {
         print_denoise_progress_line(0, actual_steps, 0.0, 0.0, false);
     }
+    int64_t cfg_n_groups = (int64_t)(latent_h / 2) * (latent_w / 2);
+    float* d_cond_norm_sq = nullptr;
+    float* d_comb_norm_sq = nullptr;
+    if (!cfg.legacy_cfg) {
+        CUDA_CHECK(cudaMalloc(&d_cond_norm_sq, cfg_n_groups * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_comb_norm_sq, cfg_n_groups * sizeof(float)));
+    }
     for (int step = 0; step < actual_steps; step++) {
         float sigma = sigmas[step];
         float sigma_next = sigmas[step + 1];
@@ -629,13 +636,8 @@ int main(int argc, char** argv) {
             } else {
                 // Norm-preserving CFG (matches diffusers Qwen Image pipeline)
                 // Norms in packed format: groups = (H/2)*(W/2) patches, each has C*4 elements
-                int64_t n_groups = (int64_t)(latent_h / 2) * (latent_w / 2);
-                float* d_cond_norm_sq;
-                float* d_comb_norm_sq;
-                CUDA_CHECK(cudaMalloc(&d_cond_norm_sq, n_groups * sizeof(float)));
-                CUDA_CHECK(cudaMalloc(&d_comb_norm_sq, n_groups * sizeof(float)));
-                CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, n_groups * sizeof(float)));
-                CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, n_groups * sizeof(float)));
+                CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, cfg_n_groups * sizeof(float)));
+                CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, cfg_n_groups * sizeof(float)));
 
                 cfg_combine_and_norms_kernel<<<grid, block>>>(
                     (__nv_bfloat16*)denoised_cond.data,
@@ -648,9 +650,6 @@ int main(int argc, char** argv) {
                     (float*)velocity_fp32.data,
                     d_cond_norm_sq, d_comb_norm_sq,
                     n, latent_channels, latent_h, latent_w);
-
-                CUDA_CHECK(cudaFree(d_cond_norm_sq));
-                CUDA_CHECK(cudaFree(d_comb_norm_sq));
             }
         }
         denoised_uncond.free_data();
@@ -708,6 +707,8 @@ int main(int argc, char** argv) {
             print_denoise_progress_line(step + 1, actual_steps, ms, elapsed_s, finished);
         }
     }
+    if (d_cond_norm_sq) CUDA_CHECK(cudaFree(d_cond_norm_sq));
+    if (d_comb_norm_sq) CUDA_CHECK(cudaFree(d_comb_norm_sq));
     latent_bf16.free_data();
 
     // Calibration mode: close file and exit early

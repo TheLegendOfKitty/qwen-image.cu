@@ -129,6 +129,108 @@ __global__ void concat_transpose_fused_fp32(
     if (out_fp16) out_fp16[idx] = __float2half(val);
 }
 
+namespace {
+
+struct TransformerForwardWorkspace {
+    // Persistent scratch storages (all 1D); views are shaped per call.
+    Tensor img_patches, x_padded, gemm_scratch;
+    Tensor t_buf, t_emb_sin, t_after_l1, t_emb;
+    Tensor img, txt_normed, txt;
+    Tensor img_normed_fp32, txt_normed_fp32;
+    Tensor img_mod_buf, txt_mod_buf, t_emb_silu;
+    Tensor img_q, img_k, img_v, txt_q, txt_k, txt_v;
+    Tensor q_t, k_t, v_t, attn_out_t;
+    Tensor img_attn_out, txt_attn_out, img_proj, txt_proj;
+    Tensor img_mlp_fp32, txt_mlp_fp32, img_mlp_out, txt_mlp_out;
+    Tensor ada_emb, img_proj_out_fp32, img_proj_out;
+
+    // Shared activation quantization caches for Q/K/V projections.
+    Tensor img_qkv_act_int8, img_qkv_act_scales;
+    Tensor txt_qkv_act_int8, txt_qkv_act_scales;
+
+    // FP16 Q/K/V buffers for attention.
+    __half* q_t_fp16 = nullptr;
+    __half* k_t_fp16 = nullptr;
+    __half* v_t_fp16 = nullptr;
+    size_t qkv_fp16_capacity_elems = 0;
+
+    ~TransformerForwardWorkspace() {
+        free_all();
+    }
+
+    void free_all() {
+        img_patches.free_data(); x_padded.free_data(); gemm_scratch.free_data();
+        t_buf.free_data(); t_emb_sin.free_data(); t_after_l1.free_data(); t_emb.free_data();
+        img.free_data(); txt_normed.free_data(); txt.free_data();
+        img_normed_fp32.free_data(); txt_normed_fp32.free_data();
+        img_mod_buf.free_data(); txt_mod_buf.free_data(); t_emb_silu.free_data();
+        img_q.free_data(); img_k.free_data(); img_v.free_data();
+        txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
+        q_t.free_data(); k_t.free_data(); v_t.free_data(); attn_out_t.free_data();
+        img_attn_out.free_data(); txt_attn_out.free_data(); img_proj.free_data(); txt_proj.free_data();
+        img_mlp_fp32.free_data(); txt_mlp_fp32.free_data(); img_mlp_out.free_data(); txt_mlp_out.free_data();
+        ada_emb.free_data(); img_proj_out_fp32.free_data(); img_proj_out.free_data();
+        img_qkv_act_int8.free_data(); img_qkv_act_scales.free_data();
+        txt_qkv_act_int8.free_data(); txt_qkv_act_scales.free_data();
+        if (q_t_fp16) CUDA_CHECK(cudaFree(q_t_fp16));
+        if (k_t_fp16) CUDA_CHECK(cudaFree(k_t_fp16));
+        if (v_t_fp16) CUDA_CHECK(cudaFree(v_t_fp16));
+        q_t_fp16 = nullptr;
+        k_t_fp16 = nullptr;
+        v_t_fp16 = nullptr;
+        qkv_fp16_capacity_elems = 0;
+    }
+
+    Tensor view(Tensor& storage, int64_t elems, DType dtype, std::initializer_list<int64_t> dims) {
+        assert(elems >= 0);
+        int64_t capacity = (storage.data && storage.ndim > 0) ? storage.shape[0] : 0;
+        if (!storage.data || storage.dtype != dtype || capacity < elems) {
+            int64_t new_capacity = elems;
+            if (capacity > 0 && storage.dtype == dtype) {
+                int64_t doubled = capacity * 2;
+                if (doubled > new_capacity) new_capacity = doubled;
+            }
+            storage.free_data();
+            storage = Tensor::alloc({new_capacity}, dtype);
+        }
+        Tensor flat = storage.slice(0, elems);
+        return flat.view(dims);
+    }
+
+    void ensure_qkv_fp16(size_t elems) {
+        if (qkv_fp16_capacity_elems >= elems) return;
+        if (q_t_fp16) CUDA_CHECK(cudaFree(q_t_fp16));
+        if (k_t_fp16) CUDA_CHECK(cudaFree(k_t_fp16));
+        if (v_t_fp16) CUDA_CHECK(cudaFree(v_t_fp16));
+        CUDA_CHECK(cudaMalloc(&q_t_fp16, elems * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&k_t_fp16, elems * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&v_t_fp16, elems * sizeof(__half)));
+        qkv_fp16_capacity_elems = elems;
+    }
+};
+
+static TransformerForwardWorkspace& transformer_workspace() {
+    static TransformerForwardWorkspace ws;
+    return ws;
+}
+
+static inline bool can_share_qkv_quant(const QuantizedWeight& wq,
+                                       const QuantizedWeight& wk,
+                                       const QuantizedWeight& wv,
+                                       int K) {
+    if (wq.mode != QuantMode::INT8_HADAMARD ||
+        wk.mode != QuantMode::INT8_HADAMARD ||
+        wv.mode != QuantMode::INT8_HADAMARD) {
+        return false;
+    }
+    if (wq.had_block_size != wk.had_block_size || wq.had_block_size != wv.had_block_size) {
+        return false;
+    }
+    return (int)wq.data.shape[1] == K && (int)wk.data.shape[1] == K && (int)wv.data.shape[1] == K;
+}
+
+} // namespace
+
 Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& x_in,
                            float timestep_val,
@@ -156,12 +258,18 @@ Tensor transformer_forward(const TransformerWeights& w,
     int total_seq = n_txt + n_img;
 
     LOGV("Transformer: n_img=%d, n_txt=%d, total=%d\n", n_img, n_txt, total_seq);
+    TransformerForwardWorkspace& ws = transformer_workspace();
 
     // Patchify the input
-    Tensor img_patches = Tensor::alloc({n_img, in_channels}, DType::BF16);
+    Tensor img_patches = ws.view(
+        ws.img_patches, (int64_t)n_img * in_channels, DType::BF16, {n_img, in_channels});
 
     if (H_pad != H || W_pad != W) {
-        Tensor x_padded = Tensor::alloc({1, (int64_t)(x_in.shape[1]), H_pad, W_pad}, DType::BF16);
+        Tensor x_padded = ws.view(
+            ws.x_padded,
+            (int64_t)x_in.shape[1] * H_pad * W_pad,
+            DType::BF16,
+            {1, (int64_t)x_in.shape[1], H_pad, W_pad});
         x_padded.zero();
         for (int c = 0; c < (int)x_in.shape[1]; c++) {
             for (int h = 0; h < H; h++) {
@@ -174,7 +282,6 @@ Tensor transformer_forward(const TransformerWeights& w,
         }
         patchify((__nv_bfloat16*)x_padded.data, (__nv_bfloat16*)img_patches.data,
                  1, (int)x_in.shape[1], H_pad, W_pad, patch_size, patch_size);
-        x_padded.free_data();
     } else {
         patchify((__nv_bfloat16*)x_in.data, (__nv_bfloat16*)img_patches.data,
                  1, (int)x_in.shape[1], H, W, patch_size, patch_size);
@@ -213,17 +320,18 @@ Tensor transformer_forward(const TransformerWeights& w,
     grow_scratch(n_txt, inner_dim, mlp_dim);         // txt mlp fc1
     grow_scratch(n_txt, mlp_dim, inner_dim);         // txt mlp fc2
 
-    // Allocate as raw bytes (use FP32 dtype for sizing: ceil(bytes/4) elements)
-    Tensor gemm_scratch = Tensor::alloc({(max_scratch_bytes + 3) / 4}, DType::FP32);
+    // Allocate as raw bytes (use FP32 dtype for sizing: ceil(bytes/4) elements).
+    Tensor gemm_scratch = ws.view(
+        ws.gemm_scratch, (max_scratch_bytes + 3) / 4, DType::FP32, {(max_scratch_bytes + 3) / 4});
 
     // 1. Timestep embedding: scalar -> [1, 256] sinusoidal -> linear -> silu -> linear -> [1, 3072]
-    Tensor t_buf = Tensor::alloc({1}, DType::FP32);
+    Tensor t_buf = ws.view(ws.t_buf, 1, DType::FP32, {1});
     t_buf.from_host(&timestep_val);
-    Tensor t_emb_sin = Tensor::alloc({1, 256}, DType::FP32);
+    Tensor t_emb_sin = ws.view(ws.t_emb_sin, 256, DType::FP32, {1, 256});
     timestep_embedding_fp32((float*)t_buf.data, (float*)t_emb_sin.data, 1, 256, 10000.0f);
     t_buf.free_data();
 
-    Tensor t_after_l1 = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor t_after_l1 = ws.view(ws.t_after_l1, inner_dim, DType::FP32, {1, inner_dim});
     {
         linear_forward_quantized(t_emb_sin, w.time_linear1_weight, &w.time_linear1_bias,
                             t_after_l1, gemm_scratch);
@@ -231,7 +339,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     silu_fp32((float*)t_after_l1.data, (float*)t_after_l1.data, inner_dim);
     t_emb_sin.free_data();
 
-    Tensor t_emb = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor t_emb = ws.view(ws.t_emb, inner_dim, DType::FP32, {1, inner_dim});
     {
         linear_forward_quantized(t_after_l1, w.time_linear2_weight, &w.time_linear2_bias,
                             t_emb, gemm_scratch);
@@ -283,7 +391,7 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     // 2. Project inputs
     // Input projections can already stay FP32 because the source activations are BF16.
-    Tensor img = Tensor::alloc({n_img, inner_dim}, DType::FP32);
+    Tensor img = ws.view(ws.img, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
     {
         Tensor patches_2d = img_patches.view({n_img, in_channels});
         Tensor img_2d = img.view({n_img, inner_dim});
@@ -295,13 +403,13 @@ Tensor transformer_forward(const TransformerWeights& w,
     dump("cuda_img_after_proj.bin", img.data, (int64_t)n_img * inner_dim, false);
 
     // txt: RMSNorm(context) -> Linear
-    Tensor txt_normed = Tensor::alloc({n_txt, 3584}, DType::BF16);
+    Tensor txt_normed = ws.view(ws.txt_normed, (int64_t)n_txt * 3584, DType::BF16, {n_txt, 3584});
     rms_norm((__nv_bfloat16*)context.data, (__nv_bfloat16*)w.txt_norm_weight.data,
              (__nv_bfloat16*)txt_normed.data, n_txt, 3584, 1e-6f);
 
     dump("cuda_txt_after_rms.bin", txt_normed.data, (int64_t)n_txt * 3584, true);
 
-    Tensor txt = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
+    Tensor txt = ws.view(ws.txt, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
     {
         Tensor tn_2d = txt_normed.view({n_txt, 3584});
         Tensor txt_2d = txt.view({n_txt, inner_dim});
@@ -320,49 +428,56 @@ Tensor transformer_forward(const TransformerWeights& w,
     // ================================================================
 
     // FP32 intermediate buffers
-    Tensor img_normed_fp32 = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor txt_normed_fp32 = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
+    Tensor img_normed_fp32 = ws.view(ws.img_normed_fp32, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor txt_normed_fp32 = ws.view(ws.txt_normed_fp32, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
 
     // Modulation buffers stay in FP32 to match ggml's transformer math.
-    Tensor img_mod_buf = Tensor::alloc({1, 6 * inner_dim}, DType::FP32);
-    Tensor txt_mod_buf = Tensor::alloc({1, 6 * inner_dim}, DType::FP32);
-    Tensor t_emb_silu = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor img_mod_buf = ws.view(ws.img_mod_buf, 6 * inner_dim, DType::FP32, {1, 6 * inner_dim});
+    Tensor txt_mod_buf = ws.view(ws.txt_mod_buf, 6 * inner_dim, DType::FP32, {1, 6 * inner_dim});
+    Tensor t_emb_silu = ws.view(ws.t_emb_silu, inner_dim, DType::FP32, {1, inner_dim});
 
     // Attention Q/K/V buffers (FP32 - output of linear_forward_fp32out)
-    Tensor img_q = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor img_k = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor img_v = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor txt_q = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
-    Tensor txt_k = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
-    Tensor txt_v = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
+    Tensor img_q = ws.view(ws.img_q, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor img_k = ws.view(ws.img_k, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor img_v = ws.view(ws.img_v, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor txt_q = ws.view(ws.txt_q, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
+    Tensor txt_k = ws.view(ws.txt_k, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
+    Tensor txt_v = ws.view(ws.txt_v, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
 
     // Transposed attention buffers (FP32): [n_heads, total_seq, head_dim]
-    Tensor q_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
-    Tensor k_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
-    Tensor v_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
-    Tensor attn_out_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
+    Tensor q_t = ws.view(ws.q_t, (int64_t)n_heads * total_seq * head_dim, DType::FP32, {n_heads, total_seq, head_dim});
+    Tensor k_t = ws.view(ws.k_t, (int64_t)n_heads * total_seq * head_dim, DType::FP32, {n_heads, total_seq, head_dim});
+    Tensor v_t = ws.view(ws.v_t, (int64_t)n_heads * total_seq * head_dim, DType::FP32, {n_heads, total_seq, head_dim});
+    Tensor attn_out_t = ws.view(ws.attn_out_t, (int64_t)n_heads * total_seq * head_dim, DType::FP32, {n_heads, total_seq, head_dim});
 
     // FP16 Q/K/V for attention (avoids separate FP32→FP16 conversions)
-    size_t qkv_fp16_size = (size_t)n_heads * total_seq * head_dim * sizeof(__half);
-    __half* q_t_fp16;
-    __half* k_t_fp16;
-    __half* v_t_fp16;
-    CUDA_CHECK(cudaMalloc(&q_t_fp16, qkv_fp16_size));
-    CUDA_CHECK(cudaMalloc(&k_t_fp16, qkv_fp16_size));
-    CUDA_CHECK(cudaMalloc(&v_t_fp16, qkv_fp16_size));
+    size_t qkv_fp16_elems = (size_t)n_heads * total_seq * head_dim;
+    ws.ensure_qkv_fp16(qkv_fp16_elems);
+    __half* q_t_fp16 = ws.q_t_fp16;
+    __half* k_t_fp16 = ws.k_t_fp16;
+    __half* v_t_fp16 = ws.v_t_fp16;
 
 
     // Post-attention (FP32)
-    Tensor img_attn_out = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor txt_attn_out = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
-    Tensor img_proj = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor txt_proj = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
+    Tensor img_attn_out = ws.view(ws.img_attn_out, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor txt_attn_out = ws.view(ws.txt_attn_out, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
+    Tensor img_proj = ws.view(ws.img_proj, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor txt_proj = ws.view(ws.txt_proj, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
 
     // MLP buffers
-    Tensor img_mlp_fp32 = Tensor::alloc({n_img, mlp_dim}, DType::FP32);  // fc1 output + gelu
-    Tensor txt_mlp_fp32 = Tensor::alloc({n_txt, mlp_dim}, DType::FP32);
-    Tensor img_mlp_out = Tensor::alloc({n_img, inner_dim}, DType::FP32);
-    Tensor txt_mlp_out = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
+    Tensor img_mlp_fp32 = ws.view(ws.img_mlp_fp32, (int64_t)n_img * mlp_dim, DType::FP32, {n_img, mlp_dim});  // fc1 output + gelu
+    Tensor txt_mlp_fp32 = ws.view(ws.txt_mlp_fp32, (int64_t)n_txt * mlp_dim, DType::FP32, {n_txt, mlp_dim});
+    Tensor img_mlp_out = ws.view(ws.img_mlp_out, (int64_t)n_img * inner_dim, DType::FP32, {n_img, inner_dim});
+    Tensor txt_mlp_out = ws.view(ws.txt_mlp_out, (int64_t)n_txt * inner_dim, DType::FP32, {n_txt, inner_dim});
+
+    Tensor img_qkv_act_int8 = ws.view(
+        ws.img_qkv_act_int8, (int64_t)n_img * inner_dim, DType::INT8, {(int64_t)n_img * inner_dim});
+    Tensor img_qkv_act_scales = ws.view(
+        ws.img_qkv_act_scales, n_img, DType::FP32, {n_img});
+    Tensor txt_qkv_act_int8 = ws.view(
+        ws.txt_qkv_act_int8, (int64_t)n_txt * inner_dim, DType::INT8, {(int64_t)n_txt * inner_dim});
+    Tensor txt_qkv_act_scales = ws.view(
+        ws.txt_qkv_act_scales, n_txt, DType::FP32, {n_txt});
 
     // 3. Run 60 transformer blocks
     const int internal_dump_block = get_transformer_internal_dump_block();
@@ -443,17 +558,51 @@ Tensor transformer_forward(const TransformerWeights& w,
             Tensor oq = img_q.view({n_img, inner_dim});
             Tensor ok = img_k.view({n_img, inner_dim});
             Tensor ov = img_v.view({n_img, inner_dim});
-            linear_forward_quantized(img_normed_fp32, b.to_q_weight, &b.to_q_bias, oq, gemm_scratch);
-            linear_forward_quantized(img_normed_fp32, b.to_k_weight, &b.to_k_bias, ok, gemm_scratch);
-            linear_forward_quantized(img_normed_fp32, b.to_v_weight, &b.to_v_bias, ov, gemm_scratch);
+            if (can_share_qkv_quant(b.to_q_weight, b.to_k_weight, b.to_v_weight, inner_dim)) {
+                quantize_activation_int8_hadamard_fp32(
+                    (const float*)img_normed_fp32.data,
+                    (int8_t*)img_qkv_act_int8.data,
+                    (float*)img_qkv_act_scales.data,
+                    n_img, inner_dim, b.to_q_weight.had_block_size);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)img_qkv_act_int8.data, (const float*)img_qkv_act_scales.data,
+                    n_img, inner_dim, b.to_q_weight, &b.to_q_bias, oq, gemm_scratch);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)img_qkv_act_int8.data, (const float*)img_qkv_act_scales.data,
+                    n_img, inner_dim, b.to_k_weight, &b.to_k_bias, ok, gemm_scratch);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)img_qkv_act_int8.data, (const float*)img_qkv_act_scales.data,
+                    n_img, inner_dim, b.to_v_weight, &b.to_v_bias, ov, gemm_scratch);
+            } else {
+                linear_forward_quantized(img_normed_fp32, b.to_q_weight, &b.to_q_bias, oq, gemm_scratch);
+                linear_forward_quantized(img_normed_fp32, b.to_k_weight, &b.to_k_bias, ok, gemm_scratch);
+                linear_forward_quantized(img_normed_fp32, b.to_v_weight, &b.to_v_bias, ov, gemm_scratch);
+            }
         }
         {
             Tensor oq = txt_q.view({n_txt, inner_dim});
             Tensor ok = txt_k.view({n_txt, inner_dim});
             Tensor ov = txt_v.view({n_txt, inner_dim});
-            linear_forward_quantized(txt_normed_fp32, b.add_q_proj_weight, &b.add_q_proj_bias, oq, gemm_scratch);
-            linear_forward_quantized(txt_normed_fp32, b.add_k_proj_weight, &b.add_k_proj_bias, ok, gemm_scratch);
-            linear_forward_quantized(txt_normed_fp32, b.add_v_proj_weight, &b.add_v_proj_bias, ov, gemm_scratch);
+            if (can_share_qkv_quant(b.add_q_proj_weight, b.add_k_proj_weight, b.add_v_proj_weight, inner_dim)) {
+                quantize_activation_int8_hadamard_fp32(
+                    (const float*)txt_normed_fp32.data,
+                    (int8_t*)txt_qkv_act_int8.data,
+                    (float*)txt_qkv_act_scales.data,
+                    n_txt, inner_dim, b.add_q_proj_weight.had_block_size);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)txt_qkv_act_int8.data, (const float*)txt_qkv_act_scales.data,
+                    n_txt, inner_dim, b.add_q_proj_weight, &b.add_q_proj_bias, oq, gemm_scratch);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)txt_qkv_act_int8.data, (const float*)txt_qkv_act_scales.data,
+                    n_txt, inner_dim, b.add_k_proj_weight, &b.add_k_proj_bias, ok, gemm_scratch);
+                linear_forward_int8_prequantized(
+                    (const int8_t*)txt_qkv_act_int8.data, (const float*)txt_qkv_act_scales.data,
+                    n_txt, inner_dim, b.add_v_proj_weight, &b.add_v_proj_bias, ov, gemm_scratch);
+            } else {
+                linear_forward_quantized(txt_normed_fp32, b.add_q_proj_weight, &b.add_q_proj_bias, oq, gemm_scratch);
+                linear_forward_quantized(txt_normed_fp32, b.add_k_proj_weight, &b.add_k_proj_bias, ok, gemm_scratch);
+                linear_forward_quantized(txt_normed_fp32, b.add_v_proj_weight, &b.add_v_proj_bias, ov, gemm_scratch);
+            }
         }
 
         if (dump_internal_block) {
@@ -704,7 +853,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     dump("cuda_img_final_fp32.bin", img.data, (int64_t)n_img * inner_dim, false);
 
     // 4. AdaLayerNormContinuous output
-    Tensor ada_emb = Tensor::alloc({1, 2 * inner_dim}, DType::FP32);
+    Tensor ada_emb = ws.view(ws.ada_emb, 2 * inner_dim, DType::FP32, {1, 2 * inner_dim});
     silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
     linear_forward_quantized(t_emb_silu, w.norm_out_linear_weight, &w.norm_out_linear_bias,
                         ada_emb, gemm_scratch);
@@ -719,11 +868,19 @@ Tensor transformer_forward(const TransformerWeights& w,
     dump("cuda_img_after_adanorm.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
 
     // 5. Project out: [n_img, 3072] -> [n_img, 64]
-    Tensor img_proj_out_fp32 = Tensor::alloc({n_img, (int64_t)(patch_size * patch_size * out_channels)}, DType::FP32);
+    Tensor img_proj_out_fp32 = ws.view(
+        ws.img_proj_out_fp32,
+        (int64_t)n_img * patch_size * patch_size * out_channels,
+        DType::FP32,
+        {n_img, (int64_t)(patch_size * patch_size * out_channels)});
     linear_forward_quantized(img_normed_fp32, w.proj_out_weight, &w.proj_out_bias,
                         img_proj_out_fp32, gemm_scratch);
 
-    Tensor img_proj_out = Tensor::alloc({n_img, (int64_t)(patch_size * patch_size * out_channels)}, DType::BF16);
+    Tensor img_proj_out = ws.view(
+        ws.img_proj_out,
+        (int64_t)n_img * patch_size * patch_size * out_channels,
+        DType::BF16,
+        {n_img, (int64_t)(patch_size * patch_size * out_channels)});
     fp32_to_bf16((float*)img_proj_out_fp32.data, (__nv_bfloat16*)img_proj_out.data,
                  (int64_t)n_img * patch_size * patch_size * out_channels);
 
@@ -749,25 +906,6 @@ Tensor transformer_forward(const TransformerWeights& w,
         output.free_data();
         output = std::move(cropped);
     }
-
-    // Free all temp buffers
-    img.free_data(); txt.free_data();
-    t_emb.free_data(); t_emb_silu.free_data();
-    img_normed_fp32.free_data(); txt_normed_fp32.free_data();
-    img_mod_buf.free_data(); txt_mod_buf.free_data();
-    gemm_scratch.free_data();
-    img_q.free_data(); img_k.free_data(); img_v.free_data();
-    txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
-    q_t.free_data(); k_t.free_data(); v_t.free_data();
-    cudaFree(q_t_fp16); cudaFree(k_t_fp16); cudaFree(v_t_fp16);
-    attn_out_t.free_data();
-    img_attn_out.free_data(); txt_attn_out.free_data();
-    img_proj.free_data(); txt_proj.free_data();
-    img_mlp_fp32.free_data(); txt_mlp_fp32.free_data();
-    img_mlp_out.free_data(); txt_mlp_out.free_data();
-    ada_emb.free_data();
-    img_proj_out_fp32.free_data();
-    img_proj_out.free_data();
 
     CUDA_CHECK(cudaDeviceSynchronize());
     LOGV("Transformer done: output %s\n", output.shape_str().c_str());

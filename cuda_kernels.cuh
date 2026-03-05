@@ -262,6 +262,10 @@ void fwht_quantize_fp32(const float* input, int8_t* output, float* scales,
                          int M, int K, int had_block_size, cudaStream_t stream = 0);
 void fwht_quantize_bf16(const __nv_bfloat16* input, int8_t* output, float* scales,
                           int M, int K, int had_block_size, cudaStream_t stream = 0);
+void quantize_activation_int8_hadamard_fp32(const float* input, int8_t* output, float* scales,
+                                            int M, int K, int had_block_size, cudaStream_t stream = 0);
+void quantize_activation_int8_hadamard_bf16(const __nv_bfloat16* input, int8_t* output, float* scales,
+                                            int M, int K, int had_block_size, cudaStream_t stream = 0);
 
 // Dequantize INT32 GEMM output: out_fp32[i,j] = gemm_out[i,j] * act_scale[i] * w_scale[j] + bias[j]
 void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
@@ -278,6 +282,10 @@ void dequantize_bias_gelu(const int32_t* gemm_out, const float* act_scales, cons
 void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
                           const Tensor* bias, Tensor& out, Tensor& scratch,
                           bool apply_gelu = false);
+void linear_forward_int8_prequantized(const int8_t* act_int8, const float* act_scales,
+                                      int M, int K, const QuantizedWeight& weight,
+                                      const Tensor* bias, Tensor& out, Tensor& scratch,
+                                      bool apply_gelu = false);
 
 // INT8 linear with Hadamard rotation: BF16 input × INT8 weight → FP32 output
 void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
