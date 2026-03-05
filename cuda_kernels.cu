@@ -3094,7 +3094,9 @@ void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_sc
         x, act_packed, act_scales, M, K, group_size);
 }
 
-// Kernel C: Tiled INT4×INT4 GEMM with per-group dequantization
+// ================================================================
+// W4A4 INT4×INT4 GEMM — Naive scalar kernel (fallback)
+// ================================================================
 // Block tile: BM×BN output tile, each thread computes TM×TN outputs
 // Shared memory loads weight tiles cooperatively
 // act_packed: [M, K/2] UINT8, wgt_packed: [N, K/2] UINT8
@@ -3107,7 +3109,7 @@ void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_sc
 #define W4A4_TM 4   // each thread computes 4 rows
 #define W4A4_TN 4   // each thread computes 4 cols
 
-__global__ void w4a4_gemm_kernel(
+__global__ void w4a4_gemm_naive_kernel(
     const uint8_t* __restrict__ act_packed,
     const uint8_t* __restrict__ wgt_packed,
     const float* __restrict__ act_scales,
@@ -3222,14 +3224,213 @@ __global__ void w4a4_gemm_kernel(
     }
 }
 
+// ================================================================
+// W4A4 INT4×INT4 GEMM — Tensor Core MMA kernel
+// Uses mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32
+// BLOCK_M=64, BLOCK_N=64, K_STEP=64 (=group_size)
+// 4 warps (128 threads), 2×2 warp layout → WARP_M=32, WARP_N=32
+// Per warp: 2×2 M/N-tiles of 16, each needing 2 MMA calls = 8 MMAs/K-step
+// ================================================================
+
+// Inline PTX helper for INT4×INT4 tensor core MMA
+__device__ __forceinline__ void mma_s4s4_m16n8k64(
+    const uint32_t a[4], const uint32_t b[2],
+    const int32_t c[4], int32_t d[4])
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3])
+    );
+}
+
+__global__ void w4a4_gemm_mma_kernel(
+    const uint8_t* __restrict__ act_packed,    // [M, K/2] UINT8
+    const uint8_t* __restrict__ wgt_packed,    // [N, K/2] UINT8
+    const float* __restrict__ act_scales,      // [num_groups, M] FP32
+    const float* __restrict__ wgt_scales,      // [num_groups, N] FP32
+    float* __restrict__ output,                // [M, N] FP32
+    int M, int N, int K, int group_size)
+{
+    // Block position
+    const int bn = blockIdx.x * 64;
+    const int bm = blockIdx.y * 64;
+
+    // Warp and lane info
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int gid = lane / 4;   // groupID (0..7)
+    const int tid = lane % 4;   // threadID (0..3)
+
+    // 2×2 warp layout
+    const int warp_m = warp_id / 2;  // 0 or 1
+    const int warp_n = warp_id % 2;  // 0 or 1
+
+    const int num_groups = K / group_size;
+    const int half_gs = group_size / 2;  // 32 bytes for gs=64
+
+    // Shared memory: 64 rows × 9 uint32 (32 data bytes + 4 padding bytes)
+    // Padding avoids bank conflicts: stride=9 words, gcd(9,32)=1
+    __shared__ uint32_t shmem_a[64][9];
+    __shared__ uint32_t shmem_w[64][9];
+
+    // FP32 accumulators: [mt][nt][mma_half][d_idx] = 2×2×2×4 = 32 per thread
+    float acc[2][2][2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            #pragma unroll
+            for (int k = 0; k < 2; k++)
+                #pragma unroll
+                for (int l = 0; l < 4; l++)
+                    acc[i][j][k][l] = 0.0f;
+
+    for (int g = 0; g < num_groups; g++) {
+        const int k_byte_start = g * half_gs;
+
+        // Cooperative load: 128 threads load 64×8 uint32 for each tile
+        // Each thread loads 4 uint32 per tile (512 / 128 = 4)
+        #pragma unroll
+        for (int i = threadIdx.x; i < 64 * 8; i += 128) {
+            const int row = i / 8;
+            const int col = i % 8;
+
+            const int ma = bm + row;
+            shmem_a[row][col] = (ma < M) ?
+                ((const uint32_t*)(act_packed + (int64_t)ma * (K/2) + k_byte_start))[col] : 0;
+
+            const int na = bn + row;
+            shmem_w[row][col] = (na < N) ?
+                ((const uint32_t*)(wgt_packed + (int64_t)na * (K/2) + k_byte_start))[col] : 0;
+        }
+        __syncthreads();
+
+        // Load act scales for this thread's 4 M positions
+        // Positions: warp_m*32 + mt*16 + {gid, gid+8} for mt=0,1
+        float as[4];  // as[mt*2 + hi]: hi=0 for gid row, hi=1 for gid+8 row
+        #pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            const int m0 = bm + warp_m * 32 + mt * 16 + gid;
+            const int m1 = m0 + 8;
+            as[mt * 2]     = (m0 < M) ? act_scales[g * M + m0] : 0.0f;
+            as[mt * 2 + 1] = (m1 < M) ? act_scales[g * M + m1] : 0.0f;
+        }
+
+        // Load wgt scales for this thread's 8 N positions
+        // Positions: warp_n*32 + nt*16 + mh*8 + {tid*2, tid*2+1} for nt=0,1 mh=0,1
+        float ws[8];  // ws[nt*4 + mh*2 + parity]
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            #pragma unroll
+            for (int mh = 0; mh < 2; mh++) {
+                const int n0 = bn + warp_n * 32 + nt * 16 + mh * 8 + tid * 2;
+                const int n1 = n0 + 1;
+                const int idx = nt * 4 + mh * 2;
+                ws[idx]     = (n0 < N) ? wgt_scales[g * N + n0] : 0.0f;
+                ws[idx + 1] = (n1 < N) ? wgt_scales[g * N + n1] : 0.0f;
+            }
+        }
+
+        // MMA loop: 2 M-tiles × 2 N-tiles × 2 MMA calls = 8 MMAs
+        #pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            // Load A fragment from shmem (reused across N-tiles)
+            // MMA A (row-major m16×k64, .s4), register layout:
+            //   a[0] = row_lo, k_first_half  → shmem_a[gid][tid]
+            //   a[1] = row_hi, k_first_half  → shmem_a[gid+8][tid]
+            //   a[2] = row_lo, k_second_half → shmem_a[gid][4+tid]
+            //   a[3] = row_hi, k_second_half → shmem_a[gid+8][4+tid]
+            uint32_t a[4];
+            const int m_base = warp_m * 32 + mt * 16;
+            a[0] = shmem_a[m_base + gid][tid];
+            a[1] = shmem_a[m_base + gid + 8][tid];
+            a[2] = shmem_a[m_base + gid][4 + tid];
+            a[3] = shmem_a[m_base + gid + 8][4 + tid];
+
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                #pragma unroll
+                for (int mh = 0; mh < 2; mh++) {
+                    // Load B fragment from shmem
+                    // MMA B (col-major k64×n8, .s4), register layout:
+                    //   b[0] = B[tid*8..tid*8+7, gid]       → shmem_w[n+gid][tid]    (K first 32)
+                    //   b[1] = B[32+tid*8..32+tid*8+7, gid] → shmem_w[n+gid][4+tid]  (K second 32)
+                    uint32_t b[2];
+                    const int n_start = warp_n * 32 + nt * 16 + mh * 8;
+                    b[0] = shmem_w[n_start + gid][tid];
+                    b[1] = shmem_w[n_start + gid][4 + tid];
+
+                    // MMA: d = a * b + 0
+                    int32_t zeros[4] = {0, 0, 0, 0};
+                    int32_t d[4];
+                    mma_s4s4_m16n8k64(a, b, zeros, d);
+
+                    // Dequantize and accumulate
+                    // D output mapping:
+                    //   d[0] = D[gid, tid*2]      → m=m_base+gid,   n=n_start+tid*2
+                    //   d[1] = D[gid, tid*2+1]    → m=m_base+gid,   n=n_start+tid*2+1
+                    //   d[2] = D[gid+8, tid*2]    → m=m_base+gid+8, n=n_start+tid*2
+                    //   d[3] = D[gid+8, tid*2+1]  → m=m_base+gid+8, n=n_start+tid*2+1
+                    const float as_lo = as[mt * 2];      // scale for row gid
+                    const float as_hi = as[mt * 2 + 1];  // scale for row gid+8
+                    const int ws_idx = nt * 4 + mh * 2;
+
+                    acc[mt][nt][mh][0] += (float)d[0] * as_lo * ws[ws_idx];
+                    acc[mt][nt][mh][1] += (float)d[1] * as_lo * ws[ws_idx + 1];
+                    acc[mt][nt][mh][2] += (float)d[2] * as_hi * ws[ws_idx];
+                    acc[mt][nt][mh][3] += (float)d[3] * as_hi * ws[ws_idx + 1];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write output: each thread writes 32 elements
+    #pragma unroll
+    for (int mt = 0; mt < 2; mt++) {
+        const int m0 = bm + warp_m * 32 + mt * 16 + gid;
+        const int m1 = m0 + 8;
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            #pragma unroll
+            for (int mh = 0; mh < 2; mh++) {
+                const int n0 = bn + warp_n * 32 + nt * 16 + mh * 8 + tid * 2;
+                const int n1 = n0 + 1;
+                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] = acc[mt][nt][mh][0];
+                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] = acc[mt][nt][mh][1];
+                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] = acc[mt][nt][mh][2];
+                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] = acc[mt][nt][mh][3];
+            }
+        }
+    }
+}
+
 void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
                const float* act_scales, const float* wgt_scales,
                float* output, int M, int N, int K, int group_size, cudaStream_t stream) {
-    // BM=32, BN=64, TM=4, TN=4 → threads = (32/4)*(64/4) = 8*16 = 128
-    dim3 block(128);
-    dim3 grid((N + W4A4_BN - 1) / W4A4_BN, (M + W4A4_BM - 1) / W4A4_BM);
-    w4a4_gemm_kernel<<<grid, block, 0, stream>>>(
-        act_packed, wgt_packed, act_scales, wgt_scales, output, M, N, K, group_size);
+    static int force_naive = -1;
+    if (force_naive < 0) force_naive = (getenv("FORCE_NAIVE_W4A4") != nullptr) ? 1 : 0;
+
+    if (force_naive) {
+        // Naive scalar kernel: BM=32, BN=64, 128 threads
+        dim3 block(128);
+        dim3 grid((N + W4A4_BN - 1) / W4A4_BN, (M + W4A4_BM - 1) / W4A4_BM);
+        w4a4_gemm_naive_kernel<<<grid, block, 0, stream>>>(
+            act_packed, wgt_packed, act_scales, wgt_scales, output, M, N, K, group_size);
+    } else {
+        // MMA tensor core kernel: BM=64, BN=64, 128 threads (4 warps)
+        dim3 block(128);
+        dim3 grid((N + 63) / 64, (M + 63) / 64);
+        w4a4_gemm_mma_kernel<<<grid, block, 0, stream>>>(
+            act_packed, wgt_packed, act_scales, wgt_scales, output, M, N, K, group_size);
+    }
 }
 
 // Simple FP32 element-wise add
