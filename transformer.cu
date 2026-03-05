@@ -1,5 +1,6 @@
 #include "transformer.h"
 #include "cuda_kernels.cuh"
+#include "logging.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -154,7 +155,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     int n_txt = (int)context.shape[1];
     int total_seq = n_txt + n_img;
 
-    fprintf(stderr, "Transformer: n_img=%d, n_txt=%d, total=%d\n", n_img, n_txt, total_seq);
+    LOGV("Transformer: n_img=%d, n_txt=%d, total=%d\n", n_img, n_txt, total_seq);
 
     // Patchify the input
     Tensor img_patches = Tensor::alloc({n_img, in_channels}, DType::BF16);
@@ -664,7 +665,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         }
 
         if ((bi + 1) % 10 == 0) {
-            fprintf(stderr, "  Transformer block %d/60\n", bi + 1);
+            LOGV("  Transformer block %d/60\n", bi + 1);
             char path[128];
             snprintf(path, sizeof(path), "cuda_img_after_b%d.bin", bi);
             dump(path, img.data, (int64_t)n_img * inner_dim, false);
@@ -681,21 +682,21 @@ Tensor transformer_forward(const TransformerWeights& w,
                       prof_concat_transpose + prof_rope + prof_attention +
                       prof_transpose_split + prof_out_gemm + prof_gate_attn +
                       prof_mlp_norm + prof_mlp_gemm + prof_gate_mlp;
-        fprintf(stderr, "\n=== Block Loop Profile (60 blocks, total %.1f ms) ===\n", total);
-        fprintf(stderr, "  modulation:        %7.1f ms  (%4.1f%%)\n", prof_modulation, 100*prof_modulation/total);
-        fprintf(stderr, "  attn_norm:         %7.1f ms  (%4.1f%%)\n", prof_attn_norm, 100*prof_attn_norm/total);
-        fprintf(stderr, "  qkv_gemm:          %7.1f ms  (%4.1f%%)\n", prof_qkv_gemm, 100*prof_qkv_gemm/total);
-        fprintf(stderr, "  qk_norm:           %7.1f ms  (%4.1f%%)\n", prof_qk_norm, 100*prof_qk_norm/total);
-        fprintf(stderr, "  concat_transpose:  %7.1f ms  (%4.1f%%)\n", prof_concat_transpose, 100*prof_concat_transpose/total);
-        fprintf(stderr, "  rope:              %7.1f ms  (%4.1f%%)\n", prof_rope, 100*prof_rope/total);
-        fprintf(stderr, "  attention:         %7.1f ms  (%4.1f%%)\n", prof_attention, 100*prof_attention/total);
-        fprintf(stderr, "  transpose_split:   %7.1f ms  (%4.1f%%)\n", prof_transpose_split, 100*prof_transpose_split/total);
-        fprintf(stderr, "  out_gemm:          %7.1f ms  (%4.1f%%)\n", prof_out_gemm, 100*prof_out_gemm/total);
-        fprintf(stderr, "  gate_attn:         %7.1f ms  (%4.1f%%)\n", prof_gate_attn, 100*prof_gate_attn/total);
-        fprintf(stderr, "  mlp_norm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_norm, 100*prof_mlp_norm/total);
-        fprintf(stderr, "  mlp_gemm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_gemm, 100*prof_mlp_gemm/total);
-        fprintf(stderr, "  gate_mlp:          %7.1f ms  (%4.1f%%)\n", prof_gate_mlp, 100*prof_gate_mlp/total);
-        fprintf(stderr, "===============================================\n\n");
+        LOGV("\n=== Block Loop Profile (60 blocks, total %.1f ms) ===\n", total);
+        LOGV("  modulation:        %7.1f ms  (%4.1f%%)\n", prof_modulation, 100*prof_modulation/total);
+        LOGV("  attn_norm:         %7.1f ms  (%4.1f%%)\n", prof_attn_norm, 100*prof_attn_norm/total);
+        LOGV("  qkv_gemm:          %7.1f ms  (%4.1f%%)\n", prof_qkv_gemm, 100*prof_qkv_gemm/total);
+        LOGV("  qk_norm:           %7.1f ms  (%4.1f%%)\n", prof_qk_norm, 100*prof_qk_norm/total);
+        LOGV("  concat_transpose:  %7.1f ms  (%4.1f%%)\n", prof_concat_transpose, 100*prof_concat_transpose/total);
+        LOGV("  rope:              %7.1f ms  (%4.1f%%)\n", prof_rope, 100*prof_rope/total);
+        LOGV("  attention:         %7.1f ms  (%4.1f%%)\n", prof_attention, 100*prof_attention/total);
+        LOGV("  transpose_split:   %7.1f ms  (%4.1f%%)\n", prof_transpose_split, 100*prof_transpose_split/total);
+        LOGV("  out_gemm:          %7.1f ms  (%4.1f%%)\n", prof_out_gemm, 100*prof_out_gemm/total);
+        LOGV("  gate_attn:         %7.1f ms  (%4.1f%%)\n", prof_gate_attn, 100*prof_gate_attn/total);
+        LOGV("  mlp_norm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_norm, 100*prof_mlp_norm/total);
+        LOGV("  mlp_gemm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_gemm, 100*prof_mlp_gemm/total);
+        LOGV("  gate_mlp:          %7.1f ms  (%4.1f%%)\n", prof_gate_mlp, 100*prof_gate_mlp/total);
+        LOGV("===============================================\n\n");
         cudaEventDestroy(ev_start);
         cudaEventDestroy(ev_end);
     }
@@ -769,6 +770,6 @@ Tensor transformer_forward(const TransformerWeights& w,
     img_proj_out.free_data();
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    fprintf(stderr, "Transformer done: output %s\n", output.shape_str().c_str());
+    LOGV("Transformer done: output %s\n", output.shape_str().c_str());
     return output;
 }

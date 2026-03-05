@@ -9,6 +9,7 @@
 
 #include "json_parser.h"
 #include "safetensors.h"
+#include "logging.h"
 
 class Qwen2Tokenizer {
 public:
@@ -95,7 +96,7 @@ public:
         for (auto& [key, val] : vroot.object_val) {
             vocab[key] = (int32_t)val.to_int();
         }
-        fprintf(stderr, "Tokenizer: loaded %zu vocab entries\n", vocab.size());
+        LOGV("Tokenizer: loaded %zu vocab entries\n", vocab.size());
 
         // Load merges.txt
         std::ifstream mf(merges_path);
@@ -119,7 +120,7 @@ public:
             bpe_ranks[a + " " + b] = rank++;
         }
         mf.close();
-        fprintf(stderr, "Tokenizer: loaded %zu merges\n", merges.size());
+        LOGV("Tokenizer: loaded %zu merges\n", merges.size());
     }
 
     // Load vocab and merges from embedded U8 tensors in a SafeTensorsLoader
@@ -147,7 +148,7 @@ public:
         JsonValue vroot = parser.parse(vcontent);
         for (auto& [key, val] : vroot.object_val)
             vocab[key] = (int32_t)val.to_int();
-        fprintf(stderr, "Tokenizer: loaded %zu vocab entries (from safetensors)\n", vocab.size());
+        LOGV("Tokenizer: loaded %zu vocab entries (from safetensors)\n", vocab.size());
 
         // Read merges.txt bytes
         auto mit = loader.tensors.find("tokenizer.merges_txt");
@@ -180,7 +181,7 @@ public:
             merges.push_back({a, b});
             bpe_ranks[a + " " + b] = rank++;
         }
-        fprintf(stderr, "Tokenizer: loaded %zu merges (from safetensors)\n", merges.size());
+        LOGV("Tokenizer: loaded %zu merges (from safetensors)\n", merges.size());
     }
 
     // Encode raw bytes to BPE-encoded unicode tokens

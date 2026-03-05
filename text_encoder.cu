@@ -1,9 +1,11 @@
 #include "text_encoder.h"
 #include "cuda_kernels.cuh"
 #include "rope.h"
+#include "logging.h"
 #include <vector>
 #include <cstdio>
 #include <cmath>
+#include <string>
 
 // Debug dump helper: download BF16 GPU tensor to FP32 file
 static void dump_bf16_as_f32(const void* gpu_data, int64_t n_elems, const char* path) {
@@ -14,7 +16,7 @@ static void dump_bf16_as_f32(const void* gpu_data, int64_t n_elems, const char* 
     FILE* f = fopen(path, "wb");
     fwrite(f32.data(), sizeof(float), n_elems, f);
     fclose(f);
-    fprintf(stderr, "  Dumped %s (%lld floats)\n", path, (long long)n_elems);
+    LOGV("  Dumped %s (%lld floats)\n", path, (long long)n_elems);
 }
 
 static void dump_f32(const void* gpu_data, int64_t n_elems, const char* path) {
@@ -23,7 +25,7 @@ static void dump_f32(const void* gpu_data, int64_t n_elems, const char* path) {
     FILE* f = fopen(path, "wb");
     fwrite(f32.data(), sizeof(float), n_elems, f);
     fclose(f);
-    fprintf(stderr, "  Dumped %s (%lld floats)\n", path, (long long)n_elems);
+    LOGV("  Dumped %s (%lld floats)\n", path, (long long)n_elems);
 }
 
 __global__ void apply_mrope_kernel_fp32(
@@ -135,7 +137,8 @@ static void mul_tensors_fp32(const float* a, const float* b, float* out, int64_t
 }
 
 Tensor text_encoder_forward(const TextEncoderWeights& w,
-                            const std::vector<int32_t>& token_ids) {
+                            const std::vector<int32_t>& token_ids,
+                            const char* progress_label) {
     const int seq_len = (int)token_ids.size();
     const int hidden_size = 3584;
     const int n_heads = 28;
@@ -144,7 +147,16 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
     const int intermediate_size = 18944;
     const int kv_repeats = n_heads / n_kv_heads; // 7
 
-    fprintf(stderr, "Text encoder forward: seq_len=%d\n", seq_len);
+    LOGV("Text encoder forward: seq_len=%d\n", seq_len);
+    if (!qwen_verbose_enabled()) {
+        std::string label = "Text encoder";
+        if (progress_label && progress_label[0] != '\0') {
+            label += " (";
+            label += progress_label;
+            label += ")";
+        }
+        qwen_progress_begin(label, 28);
+    }
 
     // Upload token IDs to GPU
     Tensor token_ids_gpu = Tensor::alloc({seq_len}, DType::FP32); // using FP32 as int32 container
@@ -341,7 +353,8 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
         }
 
         if ((layer + 1) % 7 == 0)
-            fprintf(stderr, "  Text encoder layer %d/28 done\n", layer + 1);
+            LOGV("  Text encoder layer %d/28 done\n", layer + 1);
+        qwen_progress_tick();
     }
 
     // Final RMSNorm
@@ -372,7 +385,8 @@ Tensor text_encoder_forward(const TextEncoderWeights& w,
     up_buf.free_data();
     mlp_out.free_data();
 
-    fprintf(stderr, "Text encoder done: output %s\n", output.shape_str().c_str());
+    LOGV("Text encoder done: output %s\n", output.shape_str().c_str());
+    qwen_progress_end();
     CUDA_CHECK(cudaDeviceSynchronize());
     return output;
 }

@@ -18,6 +18,7 @@
 #include "rope.h"
 #include "cuda_kernels.cuh"
 #include "image_io.h"
+#include "logging.h"
 
 struct Config {
     std::string prompt = "a red rose";
@@ -34,6 +35,7 @@ struct Config {
     unsigned long long seed = 42;
     float flow_shift = 0.0f; // 0 = dynamic shifting (diffusers default); >0 = fixed shift (3.0 for sd.cpp)
     bool legacy_cfg = false; // true = plain CFG (sd.cpp); false = norm-preserving CFG (diffusers)
+    bool verbose = false;
 };
 
 static Config parse_args(int argc, char** argv) {
@@ -70,6 +72,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.legacy_cfg = true;
         } else if (arg == "--flow-shift" && i + 1 < argc) {
             cfg.flow_shift = atof(argv[++i]);
+        } else if (arg == "-v" || arg == "--verbose") {
+            cfg.verbose = true;
         } else if (arg == "-h" || arg == "--help") {
             fprintf(stderr, "Usage: %s [options]\n", argv[0]);
             fprintf(stderr, "  -p, --prompt TEXT       Prompt text\n");
@@ -85,6 +89,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  --cfg-scale F           CFG scale (default: 7.0)\n");
             fprintf(stderr, "  --seed N                Random seed (default: 42)\n");
             fprintf(stderr, "  --flow-shift F          Fixed flow shift (0=dynamic, 3.0=sd.cpp)\n");
+            fprintf(stderr, "  -v, --verbose           Enable detailed logs\n");
             exit(0);
         }
     }
@@ -104,6 +109,47 @@ static bool has_suffix_ci(const std::string& s, const char* suffix) {
         }
     }
     return true;
+}
+
+static std::string format_duration(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    int total = (int)(seconds + 0.5);
+    int h = total / 3600;
+    int m = (total % 3600) / 60;
+    int s = total % 60;
+    char buf[32];
+    if (h > 0) {
+        snprintf(buf, sizeof(buf), "%dh %02dm %02ds", h, m, s);
+    } else if (m > 0) {
+        snprintf(buf, sizeof(buf), "%dm %02ds", m, s);
+    } else {
+        snprintf(buf, sizeof(buf), "%ds", s);
+    }
+    return std::string(buf);
+}
+
+static void print_denoise_progress_line(int done_steps, int total_steps, double step_ms,
+                                        double elapsed_seconds, bool finished) {
+    const int bar_width = 28;
+    int filled = (total_steps > 0) ? (done_steps * bar_width / total_steps) : bar_width;
+    if (filled < 0) filled = 0;
+    if (filled > bar_width) filled = bar_width;
+
+    std::string bar(bar_width, '-');
+    for (int i = 0; i < filled; i++) bar[i] = '=';
+    if (!finished && filled < bar_width) bar[filled] = '>';
+
+    double avg_ms = (done_steps > 0) ? (elapsed_seconds * 1000.0 / done_steps) : 0.0;
+    double eta_s = (done_steps > 0 && done_steps < total_steps)
+        ? (avg_ms * (total_steps - done_steps) / 1000.0)
+        : 0.0;
+
+    fprintf(stderr,
+            "\rDenoising [%s] %d/%d | step %.0f ms | avg %.0f ms | eta %s | elapsed %s",
+            bar.c_str(), done_steps, total_steps, step_ms, avg_ms,
+            format_duration(eta_s).c_str(), format_duration(elapsed_seconds).c_str());
+    if (finished) fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 // Latent normalization constants from VAE config
@@ -254,26 +300,32 @@ static std::vector<float> randn_philox_fp32(int64_t n, uint64_t seed) {
 int main(int argc, char** argv) {
     Config cfg = parse_args(argc, argv);
 
-    fprintf(stderr, "=== Qwen Image 2512 - CUDA Implementation ===\n");
-    fprintf(stderr, "Prompt: %s\n", cfg.prompt.c_str());
-    fprintf(stderr, "Size: %dx%d, Steps: %d, CFG: %.1f, Seed: %llu\n",
-            cfg.width, cfg.height, cfg.steps, cfg.cfg_scale, cfg.seed);
+    setenv("QWEN_VERBOSE", cfg.verbose ? "1" : "0", 1);
+
+    LOGV("=== Qwen Image 2512 - CUDA Implementation ===\n");
+    LOGV("Prompt: %s\n", cfg.prompt.c_str());
+    LOGV("Size: %dx%d, Steps: %d, CFG: %.1f, Seed: %llu\n",
+         cfg.width, cfg.height, cfg.steps, cfg.cfg_scale, cfg.seed);
+    if (!cfg.verbose) {
+        fprintf(stderr, "Generating %dx%d image in %d steps (seed %llu)\n",
+                cfg.width, cfg.height, cfg.steps, cfg.seed);
+    }
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // ========== Step 1: Load text encoder file(s) ==========
-    fprintf(stderr, "\n[1/8] Loading text encoder...\n");
+    LOGV("\n[1/8] Loading text encoder...\n");
     SafeTensorsLoader te_loader;
     if (!cfg.text_encoder.empty()) {
-        fprintf(stderr, "  Using single file: %s\n", cfg.text_encoder.c_str());
+        LOGV("  Using single file: %s\n", cfg.text_encoder.c_str());
         te_loader.load_file(cfg.text_encoder);
     } else {
         te_loader = load_model_dir(cfg.model_dir + "text_encoder");
     }
-    te_loader.print_summary();
+    if (cfg.verbose) te_loader.print_summary();
 
     // ========== Step 2: Load tokenizer ==========
-    fprintf(stderr, "\n[2/8] Loading tokenizer...\n");
+    LOGV("\n[2/8] Loading tokenizer...\n");
     Qwen2Tokenizer tokenizer;
     if (te_loader.has_tensor("tokenizer.vocab_json")) {
         tokenizer.load(te_loader);
@@ -283,25 +335,29 @@ int main(int argc, char** argv) {
     }
 
     // ========== Step 3: Tokenize & encode ==========
-    fprintf(stderr, "\n[3/8] Tokenizing...\n");
+    LOGV("\n[3/8] Tokenizing...\n");
     auto [cond_tokens, cond_strip_idx] = tokenizer.tokenize_prompt(cfg.prompt);
     auto [uncond_tokens, uncond_strip_idx] = tokenizer.tokenize_empty();
-    fprintf(stderr, "  Cond tokens: %zu (strip first %d), Uncond tokens: %zu (strip first %d)\n",
-            cond_tokens.size(), cond_strip_idx, uncond_tokens.size(), uncond_strip_idx);
-    fprintf(stderr, "  Cond IDs:");
-    for (auto t : cond_tokens) fprintf(stderr, " %d", t);
-    fprintf(stderr, "\n  Uncond IDs:");
-    for (auto t : uncond_tokens) fprintf(stderr, " %d", t);
-    fprintf(stderr, "\n");
+    LOGV("  Cond tokens: %zu (strip first %d), Uncond tokens: %zu (strip first %d)\n",
+         cond_tokens.size(), cond_strip_idx, uncond_tokens.size(), uncond_strip_idx);
+    if (cfg.verbose) {
+        fprintf(stderr, "  Cond IDs:");
+        for (auto t : cond_tokens) fprintf(stderr, " %d", t);
+        fprintf(stderr, "\n  Uncond IDs:");
+        for (auto t : uncond_tokens) fprintf(stderr, " %d", t);
+        fprintf(stderr, "\n");
+    }
 
     TextEncoderWeights te_weights;
+    if (!cfg.verbose) qwen_progress_begin("Loading text encoder tensors", 338);
     te_weights.load(te_loader);
+    if (!cfg.verbose) qwen_progress_end();
 
-    fprintf(stderr, "  Encoding conditional prompt...\n");
-    Tensor cond_context_full = text_encoder_forward(te_weights, cond_tokens);
+    LOGV("  Encoding conditional prompt...\n");
+    Tensor cond_context_full = text_encoder_forward(te_weights, cond_tokens, "cond");
 
-    fprintf(stderr, "  Encoding unconditional prompt...\n");
-    Tensor uncond_context_full = text_encoder_forward(te_weights, uncond_tokens);
+    LOGV("  Encoding unconditional prompt...\n");
+    Tensor uncond_context_full = text_encoder_forward(te_weights, uncond_tokens, "uncond");
 
     // Strip system prompt tokens from text encoder output
     // sd.cpp encodes the full prompt (system + user + assistant) but then removes
@@ -311,8 +367,8 @@ int main(int argc, char** argv) {
     auto strip_context = [&](Tensor& full, int strip_idx) -> Tensor {
         int full_seq = (int)full.shape[1];
         int new_seq = full_seq - strip_idx;
-        fprintf(stderr, "  Stripping first %d tokens: [1, %d, %d] -> [1, %d, %d]\n",
-                strip_idx, full_seq, hidden_size, new_seq, hidden_size);
+        LOGV("  Stripping first %d tokens: [1, %d, %d] -> [1, %d, %d]\n",
+             strip_idx, full_seq, hidden_size, new_seq, hidden_size);
         Tensor stripped = Tensor::alloc({1, (int64_t)new_seq, (int64_t)hidden_size}, DType::BF16);
         // Copy from offset strip_idx * hidden_size
         size_t offset_bytes = (size_t)strip_idx * hidden_size * sizeof(__nv_bfloat16);
@@ -328,7 +384,7 @@ int main(int argc, char** argv) {
 
     // Override with external context dumps for debugging
     if (getenv("LOAD_SDCPP_CONTEXT")) {
-        fprintf(stderr, "  LOADING EXTERNAL CONTEXT from sd.cpp dumps!\n");
+        LOGV("  LOADING EXTERNAL CONTEXT from sd.cpp dumps!\n");
         auto load_f32_as_bf16 = [&](const char* path, int64_t expected_n) -> Tensor {
             std::vector<float> fp(expected_n);
             FILE* f = fopen(path, "rb");
@@ -341,7 +397,7 @@ int main(int argc, char** argv) {
             int seq = (int)(expected_n / hidden_size);
             Tensor t = Tensor::alloc({1, (int64_t)seq, (int64_t)hidden_size}, DType::BF16);
             CUDA_CHECK(cudaMemcpy(t.data, bf.data(), expected_n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-            fprintf(stderr, "    Loaded %s: [1, %d, %d]\n", path, seq, hidden_size);
+            LOGV("    Loaded %s: [1, %d, %d]\n", path, seq, hidden_size);
             return t;
         };
         cond_context.free_data();
@@ -352,7 +408,7 @@ int main(int argc, char** argv) {
 
     // Load diffusers text encoder embeddings for matching comparison
     if (getenv("LOAD_DIFFUSERS_EMBED")) {
-        fprintf(stderr, "  LOADING DIFFUSERS EMBEDDINGS!\n");
+        LOGV("  LOADING DIFFUSERS EMBEDDINGS!\n");
         auto load_embed = [&](const char* path) -> Tensor {
             FILE* f = fopen(path, "rb");
             if (!f) { fprintf(stderr, "ERROR: cannot open %s\n", path); exit(1); }
@@ -368,7 +424,7 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n; i++) bf[i] = __float2bfloat16(fp[i]);
             Tensor t = Tensor::alloc({1, (int64_t)seq, (int64_t)dim}, DType::BF16);
             CUDA_CHECK(cudaMemcpy(t.data, bf.data(), n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-            fprintf(stderr, "    Loaded %s: [1, %d, %d]\n", path, seq, dim);
+            LOGV("    Loaded %s: [1, %d, %d]\n", path, seq, dim);
             return t;
         };
         cond_context.free_data();
@@ -386,32 +442,34 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n; i++) fp[i] = __bfloat162float(h[i]);
             FILE* f = fopen(path, "wb");
             if (f) { fwrite(fp.data(), sizeof(float), n, f); fclose(f); }
-            fprintf(stderr, "    Dumped %s (%ld floats)\n", path, (long)n);
+            LOGV("    Dumped %s (%ld floats)\n", path, (long)n);
         };
         dump_bf16("cuda_cond_context.bin", cond_context.data, cond_context.numel());
         dump_bf16("cuda_uncond_context.bin", uncond_context.data, uncond_context.numel());
     }
 
     // Free text encoder
-    fprintf(stderr, "  Freeing text encoder...\n");
+    LOGV("  Freeing text encoder...\n");
     te_weights.free_all();
 
     // ========== Step 4: Load transformer ==========
-    fprintf(stderr, "\n[4/8] Loading transformer...\n");
+    LOGV("\n[4/8] Loading transformer...\n");
     SafeTensorsLoader tf_loader;
     if (!cfg.transformer.empty()) {
-        fprintf(stderr, "  Using: %s\n", cfg.transformer.c_str());
+        LOGV("  Using: %s\n", cfg.transformer.c_str());
         tf_loader.load_file(cfg.transformer);
     } else {
         tf_loader = load_model_dir(cfg.model_dir + "transformer");
     }
-    tf_loader.print_summary();
+    if (cfg.verbose) tf_loader.print_summary();
 
     TransformerWeights tf_weights;
+    if (!cfg.verbose) qwen_progress_begin("Loading transformer tensors", (int)tf_loader.tensors.size());
     tf_weights.load(tf_loader);
+    if (!cfg.verbose) qwen_progress_end();
 
     // ========== Step 5: Compute RoPE PE ==========
-    fprintf(stderr, "\n[5/8] Computing RoPE positional embeddings...\n");
+    LOGV("\n[5/8] Computing RoPE positional embeddings...\n");
     int latent_h = cfg.height / 8;
     int latent_w = cfg.width / 8;
     int patch_size = 2;
@@ -427,7 +485,7 @@ int main(int argc, char** argv) {
     // pe shape: [total_pos, 64, 2, 2] = [total_pos, 256]
     Tensor pe = Tensor::alloc({(int64_t)total_pos, 64, 2, 2}, DType::FP32);
     pe.from_host(pe_vec.data(), pe_vec.size() * sizeof(float));
-    fprintf(stderr, "  PE shape: [%d, 64, 2, 2] (n_txt=%d, n_img=%d)\n", total_pos, n_txt, n_img);
+    LOGV("  PE shape: [%d, 64, 2, 2] (n_txt=%d, n_img=%d)\n", total_pos, n_txt, n_img);
 
     // Also compute PE for uncond (different seq_len potentially)
     int n_txt_uncond = (int)uncond_context.shape[1];
@@ -438,7 +496,7 @@ int main(int argc, char** argv) {
     pe_uncond.from_host(pe_uncond_vec.data(), pe_uncond_vec.size() * sizeof(float));
 
     // ========== Step 6: Initialize latent and run denoising ==========
-    fprintf(stderr, "\n[6/8] Denoising (%d steps)...\n", cfg.steps);
+    LOGV("\n[6/8] Denoising (%d steps)...\n", cfg.steps);
 
     // Initialize latent noise in FP32 (matching sd.cpp precision)
     int latent_channels = 16;
@@ -492,15 +550,20 @@ int main(int argc, char** argv) {
     Tensor latent_bf16 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
     Tensor denoised_cond;
     Tensor denoised_uncond;
+    float denoise_total_ms = 0.0f;
+    auto t_denoise_start = std::chrono::high_resolution_clock::now();
 
     int actual_steps = cal_ptr ? 1 : cfg.steps; // calibrate only needs 1 step
+    if (!cfg.verbose && !cal_ptr) {
+        print_denoise_progress_line(0, actual_steps, 0.0, 0.0, false);
+    }
     for (int step = 0; step < actual_steps; step++) {
         float sigma = sigmas[step];
         float sigma_next = sigmas[step + 1];
         float timestep = sigma * 1000.0f;
 
-        fprintf(stderr, "  Step %d/%d: sigma=%.4f, timestep=%.1f\n",
-                step + 1, actual_steps, sigma, timestep);
+        LOGV("  Step %d/%d: sigma=%.4f, timestep=%.1f\n",
+             step + 1, actual_steps, sigma, timestep);
 
         auto t_step = std::chrono::high_resolution_clock::now();
 
@@ -633,10 +696,17 @@ int main(int argc, char** argv) {
         }
 
         denoised_fp32.free_data();
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         auto t_step_end = std::chrono::high_resolution_clock::now();
         float ms = std::chrono::duration<float, std::milli>(t_step_end - t_step).count();
-        fprintf(stderr, "    Step time: %.0f ms\n", ms);
+        denoise_total_ms += ms;
+        LOGV("    Step time: %.0f ms\n", ms);
+        if (!cfg.verbose && !cal_ptr) {
+            double elapsed_s = std::chrono::duration<double>(t_step_end - t_denoise_start).count();
+            bool finished = (step + 1) == actual_steps;
+            print_denoise_progress_line(step + 1, actual_steps, ms, elapsed_s, finished);
+        }
     }
     latent_bf16.free_data();
 
@@ -656,7 +726,7 @@ int main(int argc, char** argv) {
     }
 
     // Free transformer
-    fprintf(stderr, "\n  Freeing transformer...\n");
+    LOGV("\n  Freeing transformer...\n");
     tf_weights.free_all();
     pe.free_data();
     pe_uncond.free_data();
@@ -664,7 +734,7 @@ int main(int argc, char** argv) {
     uncond_context.free_data();
 
     // ========== Step 7: VAE decode ==========
-    fprintf(stderr, "\n[7/8] VAE decoding...\n");
+    LOGV("\n[7/8] VAE decoding...\n");
 
     // Denormalize latent in FP32: x[c] = x[c] * std[c] + mean[c]
     {
@@ -686,15 +756,17 @@ int main(int argc, char** argv) {
     // Load VAE
     SafeTensorsLoader vae_loader;
     if (!cfg.vae.empty()) {
-        fprintf(stderr, "  Using: %s\n", cfg.vae.c_str());
+        LOGV("  Using: %s\n", cfg.vae.c_str());
         vae_loader.load_file(cfg.vae);
     } else {
         vae_loader = load_model_dir(cfg.model_dir + "vae");
     }
-    vae_loader.print_summary();
+    if (cfg.verbose) vae_loader.print_summary();
 
     VAEDecoderWeights vae_weights;
+    if (!cfg.verbose) qwen_progress_begin("Loading VAE tensors", (int)vae_loader.tensors.size());
     vae_weights.load(vae_loader);
+    if (!cfg.verbose) qwen_progress_end();
 
     // Reshape latent to [16, 1, H/8, W/8] for WAN VAE
     Tensor latent_4d = latent_bf16_vae.view({(int64_t)latent_channels, 1, (int64_t)latent_h, (int64_t)latent_w});
@@ -704,7 +776,7 @@ int main(int argc, char** argv) {
     vae_weights.free_all();
 
     // ========== Step 8: Save image ==========
-    fprintf(stderr, "\n[8/8] Saving image to %s...\n", cfg.output.c_str());
+    LOGV("\n[8/8] Saving image to %s...\n", cfg.output.c_str());
 
     // Convert BF16 [3, 1, H, W] -> uint8 [H, W, 3]
     // First reshape to [3, H, W]
@@ -735,9 +807,15 @@ int main(int argc, char** argv) {
     float total_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
 
     if (ok) {
-        fprintf(stderr, "\nDone! Image saved to %s (%.1f seconds total)\n", cfg.output.c_str(), total_ms / 1000.0f);
+        if (!cfg.verbose && !cal_ptr) {
+            float denoise_avg_ms = (actual_steps > 0) ? (denoise_total_ms / actual_steps) : 0.0f;
+            fprintf(stderr, "Denoising complete: %.1f s total (avg %.0f ms/step)\n",
+                    denoise_total_ms / 1000.0f, denoise_avg_ms);
+        }
+        fprintf(stderr, "Done! Image saved to %s (%.1f seconds total)\n",
+                cfg.output.c_str(), total_ms / 1000.0f);
     } else {
-        fprintf(stderr, "\nError saving image!\n");
+        fprintf(stderr, "Error saving image!\n");
         return 1;
     }
 

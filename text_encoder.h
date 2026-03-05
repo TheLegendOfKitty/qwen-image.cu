@@ -3,6 +3,7 @@
 #include "safetensors.h"
 #include "cuda_kernels.cuh"
 #include "rope.h"
+#include "logging.h"
 #include <string>
 #include <vector>
 
@@ -32,7 +33,7 @@ struct TextEncoderWeights {
     std::vector<Layer> layers;
 
     void load(const SafeTensorsLoader& loader) {
-        fprintf(stderr, "Loading text encoder weights...\n");
+        LOGV("Loading text encoder weights...\n");
 
         embed_tokens = loader.load_tensor("model.embed_tokens.weight");
         norm_weight = loader.load_tensor("model.norm.weight");
@@ -58,9 +59,9 @@ struct TextEncoderWeights {
             l.down_proj_weight = loader.load_tensor(prefix + "mlp.down_proj.weight");
 
             if ((i + 1) % 7 == 0)
-                fprintf(stderr, "  Loaded layer %d/28\n", i + 1);
+                LOGV("  Loaded layer %d/28\n", i + 1);
         }
-        fprintf(stderr, "Text encoder weights loaded.\n");
+        LOGV("Text encoder weights loaded.\n");
     }
 
     void free_all() {
@@ -88,4 +89,5 @@ struct TextEncoderWeights {
 // tokens: host vector of token IDs
 // Returns: Tensor [1, seq_len, 3584] on GPU
 Tensor text_encoder_forward(const TextEncoderWeights& w,
-                            const std::vector<int32_t>& token_ids);
+                            const std::vector<int32_t>& token_ids,
+                            const char* progress_label = nullptr);

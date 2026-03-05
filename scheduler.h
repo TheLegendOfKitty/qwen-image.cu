@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include "logging.h"
 
 // FlowMatchEulerDiscreteScheduler
 // Matches diffusers' FlowMatchEulerDiscreteScheduler for Qwen Image
@@ -74,8 +75,8 @@ struct FlowMatchScheduler {
         if (use_dynamic_shifting && image_seq_len > 0) {
             // Compute mu via linear interpolation, then apply exponential time shift
             float mu = calculate_shift_mu(image_seq_len);
-            fprintf(stderr, "Scheduler: dynamic shift mu=%.4f (exp(mu)=%.4f) for seq_len=%d\n",
-                    mu, std::exp(mu), image_seq_len);
+            LOGV("Scheduler: dynamic shift mu=%.4f (exp(mu)=%.4f) for seq_len=%d\n",
+                 mu, std::exp(mu), image_seq_len);
             for (int i = 0; i < n_steps; i++) {
                 sigmas[i] = time_shift_exponential(mu, sigmas[i]);
             }

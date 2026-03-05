@@ -1,5 +1,6 @@
 #include "vae_decoder.h"
 #include "cuda_kernels.cuh"
+#include "logging.h"
 #include <cstdio>
 #include <cmath>
 
@@ -40,7 +41,7 @@ static ResBlockWeights load_resblock(const SafeTensorsLoader& loader, const std:
 }
 
 void VAEDecoderWeights::load(const SafeTensorsLoader& loader) {
-    fprintf(stderr, "Loading VAE decoder weights...\n");
+    LOGV("Loading VAE decoder weights...\n");
 
     // post_quant_conv: CausalConv3d(16, 16, 1,1,1) - identity-like
     conv2 = load_causal_conv3d(loader, "post_quant_conv.", 16, 16, 1, 1, 1, 0, 0);
@@ -149,7 +150,7 @@ void VAEDecoderWeights::load(const SafeTensorsLoader& loader) {
     head_norm_gamma = loader.load_tensor("decoder.norm_out.gamma");
     head_conv = load_causal_conv3d(loader, "decoder.conv_out.", 96, 3, 3, 3, 3, 1, 1);
 
-    fprintf(stderr, "VAE decoder loaded: %d upsample blocks\n", (int)upsamples.size());
+    LOGV("VAE decoder loaded: %d upsample blocks\n", (int)upsamples.size());
 }
 
 void VAEDecoderWeights::free_all() {
@@ -450,7 +451,7 @@ static Tensor run_resample(const ResampleWeights& rs, Tensor x, int C, int T, in
 }
 
 Tensor vae_decode(const VAEDecoderWeights& w, const Tensor& latent, int H_latent, int W_latent) {
-    fprintf(stderr, "VAE decode: latent [16, 1, %d, %d]\n", H_latent, W_latent);
+    LOGV("VAE decode: latent [16, 1, %d, %d]\n", H_latent, W_latent);
 
     // conv2: CausalConv3d(16, 16, 1,1,1) - post_quant_conv
     int T = 1;
@@ -493,6 +494,6 @@ Tensor vae_decode(const VAEDecoderWeights& w, const Tensor& latent, int H_latent
     Tensor rgb = run_causal_conv3d(w.head_conv, x, C, T, H, Wd);
     x.free_data();
 
-    fprintf(stderr, "VAE decode done: [3, %d, %d, %d]\n", T, H, Wd);
+    LOGV("VAE decode done: [3, %d, %d, %d]\n", T, H, Wd);
     return rgb;
 }

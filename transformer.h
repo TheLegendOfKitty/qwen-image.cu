@@ -2,6 +2,7 @@
 #include "tensor.h"
 #include "safetensors.h"
 #include "cuda_kernels.cuh"
+#include "logging.h"
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -148,10 +149,10 @@ struct TransformerWeights {
         bool pre_quantized_int8 = !nunchaku && !pre_quantized_int4 &&
                                    loader.has_tensor("transformer_blocks.0.attn.to_q.weight") &&
                                    loader.get_info("transformer_blocks.0.attn.to_q.weight").dtype == DType::INT8;
-        fprintf(stderr, "Loading transformer weights (%s)...\n",
-                nunchaku ? "nunchaku INT4+SVD (swizzled)" :
-                pre_quantized_int4 ? "pre-quantized INT4+SVD" :
-                pre_quantized_int8 ? "pre-quantized INT8" : "quantizing BF16->INT8");
+        LOGV("Loading transformer weights (%s)...\n",
+             nunchaku ? "nunchaku INT4+SVD (swizzled)" :
+             pre_quantized_int4 ? "pre-quantized INT4+SVD" :
+             pre_quantized_int8 ? "pre-quantized INT8" : "quantizing BF16->INT8");
 
         // Helper: load weight as QuantizedWeight (auto-detects INT4/INT8/BF16)
         auto load_q = [&](const std::string& name) -> QuantizedWeight {
@@ -564,9 +565,9 @@ struct TransformerWeights {
             }
 
             if ((i + 1) % 10 == 0)
-                fprintf(stderr, "  Loaded block %d/60\n", i + 1);
+                LOGV("  Loaded block %d/60\n", i + 1);
         }
-        fprintf(stderr, "Transformer weights loaded.\n");
+        LOGV("Transformer weights loaded.\n");
     }
 
     void free_all() {

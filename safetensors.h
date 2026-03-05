@@ -10,6 +10,7 @@
 
 #include "json_parser.h"
 #include "tensor.h"
+#include "logging.h"
 
 struct TensorInfo {
     std::string name;
@@ -83,7 +84,7 @@ public:
             } else if (dtype_str == "F16" || dtype_str == "float16") {
                 // We'll treat F16 as BF16 size for loading, convert later if needed
                 info.dtype = DType::BF16;
-                fprintf(stderr, "Warning: tensor '%s' is F16, treating as BF16\n", key.c_str());
+                LOGV("Warning: tensor '%s' is F16, treating as BF16\n", key.c_str());
             } else if (dtype_str == "I8" || dtype_str == "int8") {
                 info.dtype = DType::INT8;
             } else if (dtype_str == "U8" || dtype_str == "uint8") {
@@ -206,6 +207,7 @@ public:
         // Allocate GPU tensor and upload
         Tensor t = Tensor::alloc(info.shape, info.dtype);
         t.from_host(buf.data(), info.nbytes);
+        qwen_progress_tick();
         return t;
     }
 
