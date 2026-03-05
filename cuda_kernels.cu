@@ -2143,38 +2143,41 @@ void gate_add_fp32f(const float* input, const float* gate, const float* x,
 // The normalized Hadamard is an orthogonal involution: H @ H = I.
 
 __global__ void fwht_inplace_kernel(float* data, int M, int K, int block_size) {
+    extern __shared__ float smem[];
     int row = blockIdx.x;
     if (row >= M) return;
     float* row_data = data + (int64_t)row * K;
     int num_blocks = K / block_size;
 
     for (int blk = 0; blk < num_blocks; blk++) {
-        float* bdata = row_data + blk * block_size;
+        float* gdata = row_data + blk * block_size;
 
-        // Butterfly stages of the Walsh-Hadamard transform
+        // Load from global to shared memory
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x)
+            smem[i] = gdata[i];
+        __syncthreads();
+
+        // Butterfly stages of the Walsh-Hadamard transform (in shared memory)
+        int num_pairs = block_size / 2;
         for (int half = 1; half < block_size; half <<= 1) {
             int full = half << 1;
-            int num_pairs = block_size / 2;
-
             for (int pair = threadIdx.x; pair < num_pairs; pair += blockDim.x) {
                 int group = pair / half;
                 int within = pair % half;
                 int idx_a = group * full + within;
                 int idx_b = idx_a + half;
-
-                float a = bdata[idx_a];
-                float b = bdata[idx_b];
-                bdata[idx_a] = a + b;
-                bdata[idx_b] = a - b;
+                float a = smem[idx_a];
+                float b = smem[idx_b];
+                smem[idx_a] = a + b;
+                smem[idx_b] = a - b;
             }
             __syncthreads();
         }
 
-        // Normalize by 1/sqrt(block_size) to make it orthogonal
+        // Normalize and write back to global memory
         float norm = rsqrtf((float)block_size);
-        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
-            bdata[i] *= norm;
-        }
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x)
+            gdata[i] = smem[i] * norm;
         __syncthreads();
     }
 }
@@ -2182,7 +2185,8 @@ __global__ void fwht_inplace_kernel(float* data, int M, int K, int block_size) {
 void fwht_inplace(float* data, int M, int K, int had_block_size, cudaStream_t stream) {
     int threads = min(1024, had_block_size / 2);
     threads = max(32, ((threads + 31) / 32) * 32);
-    fwht_inplace_kernel<<<M, threads, 0, stream>>>(data, M, K, had_block_size);
+    size_t smem_bytes = had_block_size * sizeof(float);
+    fwht_inplace_kernel<<<M, threads, smem_bytes, stream>>>(data, M, K, had_block_size);
 }
 
 // ==================== Smooth Factor Kernels ====================
@@ -2205,43 +2209,44 @@ void apply_smooth_div(const float* x, const float* smooth, float* out, int M, in
 
 // Fused smooth division + FWHT: divides each element by smooth[j], then applies block-diagonal FWHT
 __global__ void smooth_hadamard_kernel(float* data, const float* smooth, int M, int K, int block_size) {
+    extern __shared__ float smem[];
     int row = blockIdx.x;
     if (row >= M) return;
     float* row_data = data + (int64_t)row * K;
 
-    // Step 1: Divide by smooth factors
-    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    // Step 1: Divide by smooth factors (global memory, then used by FWHT)
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
         row_data[i] /= smooth[i];
-    }
     __syncthreads();
 
-    // Step 2: FWHT (same as fwht_inplace_kernel)
+    // Step 2: FWHT in shared memory
     int num_blocks = K / block_size;
     for (int blk = 0; blk < num_blocks; blk++) {
-        float* bdata = row_data + blk * block_size;
+        float* gdata = row_data + blk * block_size;
 
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x)
+            smem[i] = gdata[i];
+        __syncthreads();
+
+        int num_pairs = block_size / 2;
         for (int half = 1; half < block_size; half <<= 1) {
             int full = half << 1;
-            int num_pairs = block_size / 2;
-
             for (int pair = threadIdx.x; pair < num_pairs; pair += blockDim.x) {
                 int group = pair / half;
                 int within = pair % half;
                 int idx_a = group * full + within;
                 int idx_b = idx_a + half;
-
-                float a = bdata[idx_a];
-                float b = bdata[idx_b];
-                bdata[idx_a] = a + b;
-                bdata[idx_b] = a - b;
+                float a = smem[idx_a];
+                float b = smem[idx_b];
+                smem[idx_a] = a + b;
+                smem[idx_b] = a - b;
             }
             __syncthreads();
         }
 
         float norm = rsqrtf((float)block_size);
-        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
-            bdata[i] *= norm;
-        }
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x)
+            gdata[i] = smem[i] * norm;
         __syncthreads();
     }
 }
@@ -2249,7 +2254,8 @@ __global__ void smooth_hadamard_kernel(float* data, const float* smooth, int M, 
 void smooth_hadamard_inplace(float* data, const float* smooth, int M, int K, int had_block_size, cudaStream_t stream) {
     int threads = min(1024, max(had_block_size / 2, K / 4));
     threads = max(32, ((threads + 31) / 32) * 32);
-    smooth_hadamard_kernel<<<M, threads, 0, stream>>>(data, smooth, M, K, had_block_size);
+    size_t smem_bytes = had_block_size * sizeof(float);
+    smooth_hadamard_kernel<<<M, threads, smem_bytes, stream>>>(data, smooth, M, K, had_block_size);
 }
 
 // Warp + block reduction for max value (shared across quantization kernels)
@@ -2413,6 +2419,115 @@ void quantize_activation_per_token_bf16(const __nv_bfloat16* x, int8_t* out, flo
     quantize_activation_per_token_bf16_kernel<<<M, threads, 0, stream>>>(x, out, scales, M, K);
 }
 
+// ==================== Fused FWHT + Quantize ====================
+// Out-of-place FWHT (in shared memory) + per-token INT8 quantization in a single kernel.
+// Reads from input x[M, K] (FP32 or BF16), writes INT8 output + FP32 scales.
+// Eliminates the D2D memcpy and global-memory butterfly stages of the separate pipeline.
+// Shared memory: (K + 32) floats — all K elements fit in smem for FWHT + max-reduce.
+// All Hadamard blocks are processed in parallel (they occupy non-overlapping smem ranges).
+
+template<typename T>
+__global__ void fwht_quantize_kernel(
+    const T* __restrict__ input,   // [M, K] input (FP32 or BF16)
+    int8_t* __restrict__ output,   // [M, K] quantized INT8
+    float* __restrict__ scales,    // [M] per-token scales
+    int M, int K, int block_size)
+{
+    extern __shared__ float smem[];  // K floats for data + 32 floats for reduction
+    float* red = smem + K;          // reduction workspace (32 floats)
+
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    const T* in_row = input + (int64_t)row * K;
+    int8_t* out_row = output + (int64_t)row * K;
+
+    // Step 1: Load entire row to shared memory (converting BF16→FP32 if needed)
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        smem[i] = (sizeof(T) == 2) ? __bfloat162float(*(const __nv_bfloat16*)(in_row + i))
+                                   : *(const float*)(in_row + i);
+    __syncthreads();
+
+    // Step 2: FWHT butterfly stages in shared memory
+    // Process all Hadamard blocks in parallel (they occupy non-overlapping smem ranges)
+    int num_blocks = K / block_size;
+    int pairs_per_block = block_size / 2;
+    int total_pairs = num_blocks * pairs_per_block;
+
+    for (int half = 1; half < block_size; half <<= 1) {
+        int full = half << 1;
+        for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
+            int blk = pair / pairs_per_block;
+            int local_pair = pair - blk * pairs_per_block;
+            int group = local_pair / half;
+            int within = local_pair - group * half;
+            int base = blk * block_size;
+            int idx_a = base + group * full + within;
+            int idx_b = idx_a + half;
+            float a = smem[idx_a];
+            float b = smem[idx_b];
+            smem[idx_a] = a + b;
+            smem[idx_b] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize by 1/sqrt(block_size)
+    float norm = rsqrtf((float)block_size);
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        smem[i] *= norm;
+    // No sync needed before max-reduce: same threads that wrote will read their own elements
+
+    // Step 3: Find max absolute value across entire row (data still in shared memory)
+    float max_val = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        max_val = fmaxf(max_val, fabsf(smem[i]));
+
+    // Block-wide max reduction using warp shuffles + shared memory
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    int lane = threadIdx.x % warpSize;
+    int warp = threadIdx.x / warpSize;
+    if (lane == 0) red[warp] = max_val;
+    __syncthreads();
+    if (warp == 0) {
+        max_val = (lane < (blockDim.x + warpSize - 1) / warpSize) ? red[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    }
+    if (threadIdx.x == 0) {
+        red[0] = max_val;
+        scales[row] = max_val / 127.0f;
+    }
+    __syncthreads();
+    max_val = red[0];
+
+    // Step 4: Quantize directly from shared memory → global INT8
+    float inv_scale = (max_val > 0.0f) ? 127.0f / max_val : 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        float v = smem[i] * inv_scale;
+        int vi = __float2int_rn(v);
+        vi = max(-128, min(127, vi));
+        out_row[i] = (int8_t)vi;
+    }
+}
+
+void fwht_quantize_fp32(const float* input, int8_t* output, float* scales,
+                         int M, int K, int had_block_size, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    size_t smem_bytes = ((size_t)K + 32) * sizeof(float);
+    fwht_quantize_kernel<float><<<M, threads, smem_bytes, stream>>>(
+        input, output, scales, M, K, had_block_size);
+}
+
+void fwht_quantize_bf16(const __nv_bfloat16* input, int8_t* output, float* scales,
+                          int M, int K, int had_block_size, cudaStream_t stream) {
+    int threads = min(1024, ((K + 31) / 32) * 32);
+    size_t smem_bytes = ((size_t)K + 32) * sizeof(float);
+    fwht_quantize_kernel<__nv_bfloat16><<<M, threads, smem_bytes, stream>>>(
+        input, output, scales, M, K, had_block_size);
+}
+
 // Dequantize INT32 GEMM output + add bias
 // out[i,j] = gemm_out[i,j] * act_scales[i] * w_scales[j] + bias[j]
 __global__ void dequantize_and_bias_kernel(
@@ -2467,14 +2582,12 @@ void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
     int8_t* act_int8 = (int8_t*)((char*)scratch.data + int8_offset);
     float* act_scales = (float*)((char*)scratch.data + scales_offset);
 
-    // Step 1: Copy activation to scratch and apply Hadamard rotation
-    CUDA_CHECK(cudaMemcpy(fp32_temp, x.data, (int64_t)M * K * sizeof(float), cudaMemcpyDeviceToDevice));
+    // Steps 1+2: Fused out-of-place FWHT (shared memory) + per-token INT8 quantization
     if (weight.had_block_size > 1) {
-        fwht_inplace(fp32_temp, M, K, weight.had_block_size);
+        fwht_quantize_fp32((const float*)x.data, act_int8, act_scales, M, K, weight.had_block_size);
+    } else {
+        quantize_activation_per_token_fp32((const float*)x.data, act_int8, act_scales, M, K);
     }
-
-    // Step 2: Quantize rotated activation per-token
-    quantize_activation_per_token_fp32(fp32_temp, act_int8, act_scales, M, K);
 
     // Step 3: INT8 GEMM (reuse Region A for INT32 output)
     int32_t* gemm_out = (int32_t*)scratch.data;
@@ -2517,14 +2630,12 @@ void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
     int8_t* act_int8 = (int8_t*)((char*)scratch.data + int8_offset);
     float* act_scales = (float*)((char*)scratch.data + scales_offset);
 
-    // Step 1: Convert BF16 → FP32 and apply Hadamard rotation
-    bf16_to_fp32((__nv_bfloat16*)x.data, fp32_temp, (int64_t)M * K);
+    // Steps 1+2: Fused BF16→FP32 + FWHT (shared memory) + per-token INT8 quantization
     if (weight.had_block_size > 1) {
-        fwht_inplace(fp32_temp, M, K, weight.had_block_size);
+        fwht_quantize_bf16((__nv_bfloat16*)x.data, act_int8, act_scales, M, K, weight.had_block_size);
+    } else {
+        quantize_activation_per_token_bf16((__nv_bfloat16*)x.data, act_int8, act_scales, M, K);
     }
-
-    // Step 2: Quantize rotated activation per-token
-    quantize_activation_per_token_fp32(fp32_temp, act_int8, act_scales, M, K);
 
     // Step 3: INT8 GEMM (reuse Region A for INT32 output)
     int32_t* gemm_out = (int32_t*)scratch.data;
