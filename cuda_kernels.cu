@@ -1857,26 +1857,29 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
                                bool causal, cudaStream_t stream) {
     // Pre-allocated persistent buffers (avoid cudaMalloc/Free per call)
     static float* scores = nullptr;
-    static __half* qkv_fp16 = nullptr;  // holds q_fp16, k_fp16 contiguously
+    static __half* fp16_buf = nullptr;  // holds q, k, scores_fp16, v contiguously
     static size_t scores_cap = 0;
-    static size_t qkv_cap = 0;
+    static size_t fp16_cap = 0;
 
     size_t scores_need = (size_t)BH * S * S * sizeof(float);
-    size_t qkv_need = (size_t)BH * S * D * sizeof(__half) * 2;  // q + k in FP16
+    // Need FP16 for: q[BH*S*D], k[BH*S*D], scores[BH*S*S], v[BH*S*D]
+    size_t fp16_need = (size_t)BH * ((size_t)S * D * 3 + (size_t)S * S) * sizeof(__half);
 
     if (scores_need > scores_cap) {
         if (scores) cudaFree(scores);
         CUDA_CHECK(cudaMalloc(&scores, scores_need));
         scores_cap = scores_need;
     }
-    if (qkv_need > qkv_cap) {
-        if (qkv_fp16) cudaFree(qkv_fp16);
-        CUDA_CHECK(cudaMalloc(&qkv_fp16, qkv_need));
-        qkv_cap = qkv_need;
+    if (fp16_need > fp16_cap) {
+        if (fp16_buf) cudaFree(fp16_buf);
+        CUDA_CHECK(cudaMalloc(&fp16_buf, fp16_need));
+        fp16_cap = fp16_need;
     }
 
-    __half* q_fp16 = qkv_fp16;
-    __half* k_fp16 = qkv_fp16 + (size_t)BH * S * D;
+    __half* q_fp16 = fp16_buf;
+    __half* k_fp16 = q_fp16 + (size_t)BH * S * D;
+    __half* scores_fp16 = k_fp16 + (size_t)BH * S * D;
+    __half* v_fp16 = scores_fp16 + (size_t)BH * S * S;
 
     fp32_to_fp16(q, q_fp16, (int64_t)BH * S * D, stream);
     fp32_to_fp16(k, k_fp16, (int64_t)BH * S * D, stream);
@@ -1902,8 +1905,11 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
     // Softmax (FP32)
     softmax(scores, scores, BH * S, S, stream);
 
-    // scores × V: FP32 × FP16 → FP32 output
-    // cuBLAS doesn't support mixed FP32/FP16, so use FP32 for both
+    // Convert softmax output and V to FP16 for tensor core GEMM
+    fp32_to_fp16(scores, scores_fp16, (int64_t)BH * S * S, stream);
+    fp32_to_fp16(v, v_fp16, (int64_t)BH * S * D, stream);
+
+    // scores × V: FP16 × FP16 → FP32 output (tensor cores)
     alpha = 1.0f;
     beta_val = 0.0f;
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
@@ -1911,8 +1917,8 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
         CUBLAS_OP_N, CUBLAS_OP_N,
         D, S, S,
         &alpha,
-        v, CUDA_R_32F, D, (long long)S * D,
-        scores, CUDA_R_32F, S, (long long)S * S,
+        v_fp16, CUDA_R_16F, D, (long long)S * D,
+        scores_fp16, CUDA_R_16F, S, (long long)S * S,
         &beta_val,
         out, CUDA_R_32F, D, (long long)S * D,
         BH,
