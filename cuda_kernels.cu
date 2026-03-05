@@ -3652,7 +3652,8 @@ __global__ void w4a4_gemm_regdirect_kernel(
     const float* __restrict__ wgt_scales,      // [num_groups, N] FP32
     float* __restrict__ output,                // [M, N] FP32
     int M, int N, int K, int group_size,
-    bool accumulate)                           // if true, output[i] += result instead of output[i] = result
+    bool accumulate,                           // if true, output[i] += result instead of output[i] = result
+    const __nv_bfloat16* __restrict__ bias)    // if non-null, add bias[n] to each output element
 {
     // M-tile-major ordering: blockIdx.x = M-tile, blockIdx.y = N-tile
     // This maximizes L2 cache reuse for weight data (all M-blocks for same N-tile
@@ -3755,6 +3756,7 @@ __global__ void w4a4_gemm_regdirect_kernel(
     }
 
     // Write output (accumulate mode: add to existing values e.g. LoRA output)
+    // Optionally fuse bias add
     #pragma unroll
     for (int mt = 0; mt < 2; mt++) {
         const int m0 = m_vals[mt * 2];
@@ -3763,16 +3765,21 @@ __global__ void w4a4_gemm_regdirect_kernel(
         for (int nt = 0; nt < 4; nt++) {
             const int n0 = bn + warp_n * 32 + nt * 8 + tid * 2;
             const int n1 = n0 + 1;
+            float b0 = 0.0f, b1 = 0.0f;
+            if (bias) {
+                if (n0 < N) b0 = __bfloat162float(bias[n0]);
+                if (n1 < N) b1 = __bfloat162float(bias[n1]);
+            }
             if (accumulate) {
-                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] += acc[mt][nt][0];
-                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] += acc[mt][nt][1];
-                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] += acc[mt][nt][2];
-                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] += acc[mt][nt][3];
+                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] += acc[mt][nt][0] + b0;
+                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] += acc[mt][nt][1] + b1;
+                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] += acc[mt][nt][2] + b0;
+                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] += acc[mt][nt][3] + b1;
             } else {
-                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] = acc[mt][nt][0];
-                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] = acc[mt][nt][1];
-                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] = acc[mt][nt][2];
-                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] = acc[mt][nt][3];
+                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] = acc[mt][nt][0] + b0;
+                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] = acc[mt][nt][1] + b1;
+                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] = acc[mt][nt][2] + b0;
+                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] = acc[mt][nt][3] + b1;
             }
         }
     }
@@ -3781,7 +3788,8 @@ __global__ void w4a4_gemm_regdirect_kernel(
 void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
                const float* act_scales, const float* wgt_scales,
                float* output, int M, int N, int K, int group_size,
-               const uint32_t* wgt_mma, bool accumulate, cudaStream_t stream) {
+               const uint32_t* wgt_mma, bool accumulate,
+               const __nv_bfloat16* bias, cudaStream_t stream) {
     static int force_naive = -1;
     if (force_naive < 0) force_naive = (getenv("FORCE_NAIVE_W4A4") != nullptr) ? 1 : 0;
     static int force_shmem = -1;
@@ -3798,7 +3806,7 @@ void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
         dim3 block(128);
         dim3 grid((M + 63) / 64, (N + 63) / 64);  // M-tile-major for L2 cache reuse
         w4a4_gemm_regdirect_kernel<<<grid, block, 0, stream>>>(
-            act_packed, wgt_mma, act_scales, wgt_scales, output, M, N, K, group_size, accumulate);
+            act_packed, wgt_mma, act_scales, wgt_scales, output, M, N, K, group_size, accumulate, bias);
 
         // Verify regdirect vs shmem kernel (spot-check first few calls)
         if (verify_mma) {
@@ -3951,13 +3959,15 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
 
     // 4. Residual path
     PL_START();
+    const __nv_bfloat16* bias_ptr = bias ? (__nv_bfloat16*)bias->data : nullptr;
     if (use_w4a4) {
         // W4A4 GEMM with accumulate=true: adds result directly to out (which has LoRA output)
+        // Also fuses bias add into the output write
         w4a4_gemm(act_packed, (uint8_t*)weight.qweight_rowmajor.data,
                   act_scales_ptr, (float*)weight.wscales_rowmajor.data,
                   (float*)out.data, M, N, K, weight.group_size,
                   weight.qweight_mma.data ? (const uint32_t*)weight.qweight_mma.data : nullptr,
-                  true);  // accumulate into LoRA output
+                  true, bias_ptr);  // accumulate into LoRA output + fused bias
         PL_END(prof_w4a4);
     } else if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data) {
         PL_END(prof_w4a4); // end timing for non-W4A4 paths (counts as residual)
@@ -4041,8 +4051,8 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
         }
     }
 
-    // 8. Add bias
-    if (bias) {
+    // 8. Add bias (skip if already fused into W4A4 GEMM)
+    if (bias && !use_w4a4) {
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
                       (float*)out.data, M, N);
     }

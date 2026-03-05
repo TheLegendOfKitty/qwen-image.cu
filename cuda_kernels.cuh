@@ -352,6 +352,7 @@ void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
                const float* act_scales, const float* wgt_scales,
                float* output, int M, int N, int K, int group_size,
                const uint32_t* wgt_mma = nullptr, bool accumulate = false,
+               const __nv_bfloat16* bias = nullptr,
                cudaStream_t stream = 0);
 
 // Fused: smooth_div + fp32_to_bf16 + quantize_activation_int4 in one pass
