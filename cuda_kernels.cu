@@ -3110,7 +3110,8 @@ void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_sc
 }
 
 // Fused kernel: smooth_div + fp32_to_bf16 + quantize_activation_int4
-// Reads input once, writes BF16 (for LoRA) + INT4 packed + scales in one pass.
+// One block per row, each warp processes one group independently.
+// No shared memory, no __syncthreads — pure warp-level parallelism.
 __global__ void fused_smooth_bf16_quant_kernel(
     const float* __restrict__ x,           // [M, K] FP32 input
     const float* __restrict__ smooth,      // [K] FP32 smooth factors (or nullptr)
@@ -3119,61 +3120,52 @@ __global__ void fused_smooth_bf16_quant_kernel(
     float* __restrict__ act_scales,        // [num_groups, M] FP32 scales
     int M, int K, int group_size)
 {
-    int row = blockIdx.x;
-    int group = blockIdx.y;
+    const int row = blockIdx.x;
     if (row >= M) return;
 
-    int col_start = group * group_size;
-    const float* grp = x + (int64_t)row * K + col_start;
+    const int num_groups = K / group_size;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int num_warps = blockDim.x / 32;
+    const int elems_per_thread = group_size / 32;  // gs=64 → 2 elements per thread
+    const int K_half = K / 2;
 
-    // Phase 1: Read input, apply smooth, write BF16, find absmax
-    extern __shared__ float s_vals[];  // group_size floats
-    float max_abs = 0.0f;
-    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
-        float v = grp[i];
-        if (smooth) v /= smooth[col_start + i];
-        s_vals[i] = v;
-        // Write BF16 for LoRA path
-        bf16_out[(int64_t)row * K + col_start + i] = __float2bfloat16(v);
-        float a = fabsf(v);
-        if (a > max_abs) max_abs = a;
-    }
+    for (int g = warp_id; g < num_groups; g += num_warps) {
+        const int col_start = g * group_size;
+        const float* grp = x + (int64_t)row * K + col_start;
 
-    // Warp-reduce absmax
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
-    __shared__ float s_max[8];
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
-    if (lane == 0) s_max[warp_id] = max_abs;
-    __syncthreads();
-    if (warp_id == 0) {
-        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
-        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        // Phase 1: Read, smooth-divide, write BF16, compute absmax
+        float vals[4];  // max elems_per_thread (up to gs=128)
+        float max_abs = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < elems_per_thread; i++) {
+            int col = lane * elems_per_thread + i;
+            float v = grp[col];
+            if (smooth) v /= smooth[col_start + col];
+            vals[i] = v;
+            bf16_out[(int64_t)row * K + col_start + col] = __float2bfloat16(v);
+            max_abs = fmaxf(max_abs, fabsf(v));
+        }
+
+        // Warp-only absmax reduction (no shared memory!)
+        for (int offset = 16; offset > 0; offset >>= 1)
             max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) s_max[0] = max_abs;
-    __syncthreads();
-    max_abs = s_max[0];
+        max_abs = __shfl_sync(0xffffffff, max_abs, 0);  // broadcast to all lanes
 
-    float scale = max_abs / 7.0f;
-    float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+        float scale = max_abs / 7.0f;
+        float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+        if (lane == 0) act_scales[g * M + row] = scale;
 
-    int num_groups = K / group_size;
-    if (threadIdx.x == 0)
-        act_scales[group * M + row] = scale;
-
-    // Phase 2: Quantize from shared memory and pack
-    int half_gs = group_size / 2;
-    for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
-        float v0 = s_vals[i * 2];
-        float v1 = s_vals[i * 2 + 1];
-        int q0 = (int)roundf(v0 * inv_scale); q0 = max(-7, min(7, q0));
-        int q1 = (int)roundf(v1 * inv_scale); q1 = max(-7, min(7, q1));
-        uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
-        act_packed[(int64_t)row * (K / 2) + (col_start / 2) + i] = packed;
+        // Phase 2: Quantize and pack (each thread packs its elements)
+        // elems_per_thread is always even (gs is multiple of 64)
+        #pragma unroll
+        for (int i = 0; i < elems_per_thread; i += 2) {
+            int q0 = (int)roundf(vals[i] * inv_scale);   q0 = max(-7, min(7, q0));
+            int q1 = (int)roundf(vals[i+1] * inv_scale); q1 = max(-7, min(7, q1));
+            uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+            int byte_idx = (col_start + lane * elems_per_thread + i) / 2;
+            act_packed[(int64_t)row * K_half + byte_idx] = packed;
+        }
     }
 }
 
@@ -3181,11 +3173,9 @@ void fused_smooth_bf16_quant(const float* x, const float* smooth,
                               __nv_bfloat16* bf16_out,
                               uint8_t* act_packed, float* act_scales,
                               int M, int K, int group_size, cudaStream_t stream) {
-    int num_groups = K / group_size;
-    dim3 grid(M, num_groups);
-    int block = min(256, group_size);
-    int shmem = group_size * sizeof(float);
-    fused_smooth_bf16_quant_kernel<<<grid, block, shmem, stream>>>(
+    // One block per row, 8 warps per block (each warp handles one group)
+    int block = 256;  // 8 warps
+    fused_smooth_bf16_quant_kernel<<<M, block, 0, stream>>>(
         x, smooth, bf16_out, act_packed, act_scales, M, K, group_size);
 }
 
