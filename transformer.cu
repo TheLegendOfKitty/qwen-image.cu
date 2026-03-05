@@ -79,6 +79,31 @@ __global__ void transpose_hsd_to_shd_flat_fp32(const float* src, float* dst,
     dst[(int64_t)s * H * D + h * D + d] = src[idx];
 }
 
+// Fused concat [txt(S1,H*D), img(S2,H*D)] + transpose to [H, S1+S2, D]
+// Output order: txt first, then img within each head
+__global__ void concat_transpose_fused_fp32(
+        const float* __restrict__ txt, const float* __restrict__ img,
+        float* __restrict__ out,
+        int S1, int S2, int H, int D) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int S = S1 + S2;
+    int64_t total = (int64_t)S * H * D;
+    if (idx >= total) return;
+    // idx maps to output[h][s][d] = out[h * S * D + s * D + d]
+    int d = idx % D;
+    int64_t rest = idx / D;
+    int s = rest % S;
+    int h = rest / S;
+    // Source: txt or img in [seq, H*D] layout (H*D = H concat heads)
+    float val;
+    if (s < S1) {
+        val = txt[(int64_t)s * H * D + h * D + d];
+    } else {
+        val = img[(int64_t)(s - S1) * H * D + h * D + d];
+    }
+    out[idx] = val;
+}
+
 Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& x_in,
                            float timestep_val,
@@ -286,11 +311,6 @@ Tensor transformer_forward(const TransformerWeights& w,
     Tensor txt_k = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
     Tensor txt_v = Tensor::alloc({n_txt, inner_dim}, DType::FP32);
 
-    // Concatenated Q/K/V (FP32)
-    Tensor q_cat = Tensor::alloc({total_seq, inner_dim}, DType::FP32);
-    Tensor k_cat = Tensor::alloc({total_seq, inner_dim}, DType::FP32);
-    Tensor v_cat = Tensor::alloc({total_seq, inner_dim}, DType::FP32);
-
     // Transposed attention buffers (FP32): [n_heads, total_seq, head_dim]
     Tensor q_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
     Tensor k_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
@@ -437,26 +457,21 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         PROF_END(prof_qk_norm);
 
-        // Concatenate [txt, img] along sequence dim (FP32)
+        // Fused concat [txt, img] + transpose [S, H, D] -> [H, S, D]
         PROF_START();
-        concat_seq_fp32((float*)txt_q.data, (float*)img_q.data,
-                        (float*)q_cat.data, 1, n_txt, n_img, inner_dim);
-        concat_seq_fp32((float*)txt_k.data, (float*)img_k.data,
-                        (float*)k_cat.data, 1, n_txt, n_img, inner_dim);
-        concat_seq_fp32((float*)txt_v.data, (float*)img_v.data,
-                        (float*)v_cat.data, 1, n_txt, n_img, inner_dim);
-
-        // Transpose [S, H, D] -> [H, S, D] (FP32)
         {
             int64_t total_elems = (int64_t)total_seq * n_heads * head_dim;
             int block = 256;
             int grid = (int)((total_elems + block - 1) / block);
-            transpose_shd_to_hsd_fp32<<<grid, block>>>(
-                (float*)q_cat.data, (float*)q_t.data, total_seq, n_heads, head_dim);
-            transpose_shd_to_hsd_fp32<<<grid, block>>>(
-                (float*)k_cat.data, (float*)k_t.data, total_seq, n_heads, head_dim);
-            transpose_shd_to_hsd_fp32<<<grid, block>>>(
-                (float*)v_cat.data, (float*)v_t.data, total_seq, n_heads, head_dim);
+            concat_transpose_fused_fp32<<<grid, block>>>(
+                (float*)txt_q.data, (float*)img_q.data, (float*)q_t.data,
+                n_txt, n_img, n_heads, head_dim);
+            concat_transpose_fused_fp32<<<grid, block>>>(
+                (float*)txt_k.data, (float*)img_k.data, (float*)k_t.data,
+                n_txt, n_img, n_heads, head_dim);
+            concat_transpose_fused_fp32<<<grid, block>>>(
+                (float*)txt_v.data, (float*)img_v.data, (float*)v_t.data,
+                n_txt, n_img, n_heads, head_dim);
         }
 
         if (dump_internal_block) {
@@ -730,7 +745,6 @@ Tensor transformer_forward(const TransformerWeights& w,
     gemm_scratch.free_data();
     img_q.free_data(); img_k.free_data(); img_v.free_data();
     txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
-    q_cat.free_data(); k_cat.free_data(); v_cat.free_data();
     q_t.free_data(); k_t.free_data(); v_t.free_data();
     attn_out_t.free_data(); attn_flat.free_data();
     img_attn_out.free_data(); txt_attn_out.free_data();
