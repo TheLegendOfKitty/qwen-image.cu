@@ -482,6 +482,8 @@ void silu_fp32(const float* x, float* out, int64_t n, cudaStream_t stream = 0);
 // RoPE: FP32 x, FP32 pe, FP32 output
 void rope_apply_fp32(const float* x, const float* pe, float* out,
                      int N_nhead, int L, int d_head, cudaStream_t stream = 0);
+void rope_apply_fp32_to_fp16(const float* x, const float* pe, __half* out,
+                              int N_nhead, int L, int d_head, cudaStream_t stream = 0);
 
 // Concat/Split: FP32 versions
 void concat_seq_fp32(const float* a, const float* b, float* out,
@@ -492,7 +494,9 @@ void split_seq_fp32(const float* in, float* a, float* b,
 // Attention: FP32 Q/K/V → FP32 output (converts to BF16 internally for GEMM)
 void attention_forward_fp32io(const float* q, const float* k, const float* v,
                                float* out, float scale, int BH, int S, int D,
-                               bool causal = false, cudaStream_t stream = 0);
+                               bool causal = false, cudaStream_t stream = 0,
+                               const __half* q_fp16 = nullptr,
+                               const __half* k_fp16 = nullptr);
 
 // Attention: FP32 Q/K/V → FP32 output, with full-FP32 GEMMs.
 void attention_forward_fp32(const float* q, const float* k, const float* v,

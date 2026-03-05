@@ -340,6 +340,12 @@ Tensor transformer_forward(const TransformerWeights& w,
     Tensor v_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
     Tensor attn_out_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
 
+    // FP16 Q/K after RoPE for attention (avoids separate FP32→FP16 conversion)
+    __half* q_t_fp16;
+    __half* k_t_fp16;
+    CUDA_CHECK(cudaMalloc(&q_t_fp16, (size_t)n_heads * total_seq * head_dim * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&k_t_fp16, (size_t)n_heads * total_seq * head_dim * sizeof(__half)));
+
 
     // Post-attention (FP32)
     Tensor img_attn_out = Tensor::alloc({n_img, inner_dim}, DType::FP32);
@@ -504,12 +510,12 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         PROF_END(prof_concat_transpose);
 
-        // Apply RoPE (FP32)
+        // Apply RoPE and output FP16 directly (saves separate FP32→FP16 conversion)
         PROF_START();
-        rope_apply_fp32((float*)q_t.data, (float*)pe.data, (float*)q_t.data,
-                        n_heads, total_seq, head_dim);
-        rope_apply_fp32((float*)k_t.data, (float*)pe.data, (float*)k_t.data,
-                        n_heads, total_seq, head_dim);
+        rope_apply_fp32_to_fp16((float*)q_t.data, (float*)pe.data, q_t_fp16,
+                                 n_heads, total_seq, head_dim);
+        rope_apply_fp32_to_fp16((float*)k_t.data, (float*)pe.data, k_t_fp16,
+                                 n_heads, total_seq, head_dim);
 
         if (dump_internal_block) {
             dump_internal("q_after_rope.bin", q_t.data, (int64_t)n_heads * total_seq * head_dim, false);
@@ -524,7 +530,8 @@ Tensor transformer_forward(const TransformerWeights& w,
         float attn_scale = 1.0f / sqrtf(128.0f);
         attention_forward_fp32io(
             (float*)q_t.data, (float*)k_t.data, (float*)v_t.data,
-            (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim);
+            (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim,
+            false, 0, q_t_fp16, k_t_fp16);
 
         PROF_END(prof_attention);
 
@@ -765,6 +772,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     img_q.free_data(); img_k.free_data(); img_v.free_data();
     txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
     q_t.free_data(); k_t.free_data(); v_t.free_data();
+    cudaFree(q_t_fp16); cudaFree(k_t_fp16);
     attn_out_t.free_data();
     img_attn_out.free_data(); txt_attn_out.free_data();
     img_proj.free_data(); txt_proj.free_data();
