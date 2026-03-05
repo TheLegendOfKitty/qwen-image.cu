@@ -496,7 +496,8 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
                                float* out, float scale, int BH, int S, int D,
                                bool causal = false, cudaStream_t stream = 0,
                                const __half* q_fp16 = nullptr,
-                               const __half* k_fp16 = nullptr);
+                               const __half* k_fp16 = nullptr,
+                               const __half* v_fp16 = nullptr);
 
 // Attention: FP32 Q/K/V → FP32 output, with full-FP32 GEMMs.
 void attention_forward_fp32(const float* q, const float* k, const float* v,

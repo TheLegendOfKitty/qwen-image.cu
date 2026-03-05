@@ -104,20 +104,20 @@ __global__ void transpose_split_fused_fp32(
 
 // Fused concat [txt(S1,H*D), img(S2,H*D)] + transpose to [H, S1+S2, D]
 // Output order: txt first, then img within each head
+// Optionally also writes FP16 output (for V → direct FP16 in attention)
 __global__ void concat_transpose_fused_fp32(
         const float* __restrict__ txt, const float* __restrict__ img,
         float* __restrict__ out,
-        int S1, int S2, int H, int D) {
+        int S1, int S2, int H, int D,
+        __half* __restrict__ out_fp16 = nullptr) {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int S = S1 + S2;
     int64_t total = (int64_t)S * H * D;
     if (idx >= total) return;
-    // idx maps to output[h][s][d] = out[h * S * D + s * D + d]
     int d = idx % D;
     int64_t rest = idx / D;
     int s = rest % S;
     int h = rest / S;
-    // Source: txt or img in [seq, H*D] layout (H*D = H concat heads)
     float val;
     if (s < S1) {
         val = txt[(int64_t)s * H * D + h * D + d];
@@ -125,6 +125,7 @@ __global__ void concat_transpose_fused_fp32(
         val = img[(int64_t)(s - S1) * H * D + h * D + d];
     }
     out[idx] = val;
+    if (out_fp16) out_fp16[idx] = __float2half(val);
 }
 
 Tensor transformer_forward(const TransformerWeights& w,
@@ -340,11 +341,14 @@ Tensor transformer_forward(const TransformerWeights& w,
     Tensor v_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
     Tensor attn_out_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
 
-    // FP16 Q/K after RoPE for attention (avoids separate FP32→FP16 conversion)
+    // FP16 Q/K/V for attention (avoids separate FP32→FP16 conversions)
+    size_t qkv_fp16_size = (size_t)n_heads * total_seq * head_dim * sizeof(__half);
     __half* q_t_fp16;
     __half* k_t_fp16;
-    CUDA_CHECK(cudaMalloc(&q_t_fp16, (size_t)n_heads * total_seq * head_dim * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&k_t_fp16, (size_t)n_heads * total_seq * head_dim * sizeof(__half)));
+    __half* v_t_fp16;
+    CUDA_CHECK(cudaMalloc(&q_t_fp16, qkv_fp16_size));
+    CUDA_CHECK(cudaMalloc(&k_t_fp16, qkv_fp16_size));
+    CUDA_CHECK(cudaMalloc(&v_t_fp16, qkv_fp16_size));
 
 
     // Post-attention (FP32)
@@ -500,7 +504,7 @@ Tensor transformer_forward(const TransformerWeights& w,
                 n_txt, n_img, n_heads, head_dim);
             concat_transpose_fused_fp32<<<grid, block>>>(
                 (float*)txt_v.data, (float*)img_v.data, (float*)v_t.data,
-                n_txt, n_img, n_heads, head_dim);
+                n_txt, n_img, n_heads, head_dim, v_t_fp16);
         }
 
         if (dump_internal_block) {
@@ -531,7 +535,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         attention_forward_fp32io(
             (float*)q_t.data, (float*)k_t.data, (float*)v_t.data,
             (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim,
-            false, 0, q_t_fp16, k_t_fp16);
+            false, 0, q_t_fp16, k_t_fp16, v_t_fp16);
 
         PROF_END(prof_attention);
 
@@ -772,7 +776,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     img_q.free_data(); img_k.free_data(); img_v.free_data();
     txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
     q_t.free_data(); k_t.free_data(); v_t.free_data();
-    cudaFree(q_t_fp16); cudaFree(k_t_fp16);
+    cudaFree(q_t_fp16); cudaFree(k_t_fp16); cudaFree(v_t_fp16);
     attn_out_t.free_data();
     img_attn_out.free_data(); txt_attn_out.free_data();
     img_proj.free_data(); txt_proj.free_data();

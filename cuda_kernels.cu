@@ -1955,7 +1955,8 @@ void split_seq_fp32(const float* in, float* a, float* b,
 void attention_forward_fp32io(const float* q, const float* k, const float* v,
                                float* out, float scale, int BH, int S, int D,
                                bool causal, cudaStream_t stream,
-                               const __half* q_fp16_ext, const __half* k_fp16_ext) {
+                               const __half* q_fp16_ext, const __half* k_fp16_ext,
+                               const __half* v_fp16_ext) {
     // Pre-allocated persistent buffers (avoid cudaMalloc/Free per call)
     static float* scores = nullptr;
     static __half* fp16_buf = nullptr;
@@ -1963,9 +1964,10 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
     static size_t fp16_cap = 0;
 
     size_t scores_need = (size_t)BH * S * S * sizeof(float);
-    // FP16 for: scores[BH*S*S], v[BH*S*D], optionally q[BH*S*D], k[BH*S*D]
-    size_t qk_size = q_fp16_ext ? 0 : (size_t)BH * S * D * 2;  // q+k if not external
-    size_t fp16_need = ((size_t)BH * S * S + (size_t)BH * S * D + qk_size) * sizeof(__half);
+    // FP16 for: scores[BH*S*S], optionally v[BH*S*D], optionally q[BH*S*D]+k[BH*S*D]
+    size_t qk_size = q_fp16_ext ? 0 : (size_t)BH * S * D * 2;
+    size_t v_size = v_fp16_ext ? 0 : (size_t)BH * S * D;
+    size_t fp16_need = ((size_t)BH * S * S + v_size + qk_size) * sizeof(__half);
 
     if (scores_need > scores_cap) {
         if (scores) cudaFree(scores);
@@ -1980,25 +1982,27 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
 
     const __half* q_fp16;
     const __half* k_fp16;
+    const __half* v_fp16;
     __half* scores_fp16;
-    __half* v_fp16;
+    __half* next_ptr = fp16_buf;
 
     if (q_fp16_ext) {
-        // Q and K already in FP16 (e.g., from fused RoPE+FP16)
         q_fp16 = q_fp16_ext;
         k_fp16 = k_fp16_ext;
-        scores_fp16 = fp16_buf;
-        v_fp16 = scores_fp16 + (size_t)BH * S * S;
     } else {
-        // Convert Q and K from FP32 to FP16
-        __half* q_fp16_mut = fp16_buf;
-        __half* k_fp16_mut = q_fp16_mut + (size_t)BH * S * D;
-        scores_fp16 = k_fp16_mut + (size_t)BH * S * D;
-        v_fp16 = scores_fp16 + (size_t)BH * S * S;
+        __half* q_fp16_mut = next_ptr; next_ptr += (size_t)BH * S * D;
+        __half* k_fp16_mut = next_ptr; next_ptr += (size_t)BH * S * D;
         fp32_to_fp16(q, q_fp16_mut, (int64_t)BH * S * D, stream);
         fp32_to_fp16(k, k_fp16_mut, (int64_t)BH * S * D, stream);
         q_fp16 = q_fp16_mut;
         k_fp16 = k_fp16_mut;
+    }
+    scores_fp16 = next_ptr; next_ptr += (size_t)BH * S * S;
+    if (v_fp16_ext) {
+        v_fp16 = v_fp16_ext;
+    } else {
+        __half* v_fp16_mut = next_ptr;
+        v_fp16 = v_fp16_mut;
     }
 
     float alpha = scale, beta_val = 0.0f;
@@ -2022,8 +2026,9 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
     // Fused softmax → FP16 output
     softmax_fp16out(scores, scores_fp16, BH * S, S, stream);
 
-    // Convert V to FP16 for tensor core GEMM
-    fp32_to_fp16(v, v_fp16, (int64_t)BH * S * D, stream);
+    // Convert V to FP16 for tensor core GEMM (skip if pre-computed)
+    if (!v_fp16_ext)
+        fp32_to_fp16(v, const_cast<__half*>(v_fp16), (int64_t)BH * S * D, stream);
 
     // scores × V: FP16 × FP16 → FP32 output (tensor cores)
     alpha = 1.0f;
