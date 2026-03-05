@@ -79,6 +79,29 @@ __global__ void transpose_hsd_to_shd_flat_fp32(const float* src, float* dst,
     dst[(int64_t)s * H * D + h * D + d] = src[idx];
 }
 
+// Fused transpose [H, S1+S2, D] → split to txt[S1, H*D], img[S2, H*D]
+__global__ void transpose_split_fused_fp32(
+        const float* __restrict__ in,  // [H, S1+S2, D]
+        float* __restrict__ txt,       // [S1, H*D]
+        float* __restrict__ img,       // [S2, H*D]
+        int S1, int S2, int H, int D) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int S = S1 + S2;
+    int64_t total = (int64_t)S * H * D;
+    if (idx >= total) return;
+    // idx maps to input[h][s][d] = in[h * S * D + s * D + d]
+    int d = idx % D;
+    int64_t rest = idx / D;
+    int s = rest % S;
+    int h = rest / S;
+    float val = in[idx];
+    if (s < S1) {
+        txt[(int64_t)s * H * D + h * D + d] = val;
+    } else {
+        img[(int64_t)(s - S1) * H * D + h * D + d] = val;
+    }
+}
+
 // Fused concat [txt(S1,H*D), img(S2,H*D)] + transpose to [H, S1+S2, D]
 // Output order: txt first, then img within each head
 __global__ void concat_transpose_fused_fp32(
@@ -316,7 +339,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     Tensor k_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
     Tensor v_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
     Tensor attn_out_t = Tensor::alloc({n_heads, total_seq, head_dim}, DType::FP32);
-    Tensor attn_flat = Tensor::alloc({total_seq, inner_dim}, DType::FP32);
+
 
     // Post-attention (FP32)
     Tensor img_attn_out = Tensor::alloc({n_img, inner_dim}, DType::FP32);
@@ -505,21 +528,17 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         PROF_END(prof_attention);
 
-        // Transpose back [H, S, D] -> [S, H*D] (FP32)
+        // Fused transpose [H, S, D] -> split to txt[S1, H*D], img[S2, H*D]
         PROF_START();
         {
             int64_t total_elems = (int64_t)n_heads * total_seq * head_dim;
             int block = 256;
             int grid = (int)((total_elems + block - 1) / block);
-            transpose_hsd_to_shd_flat_fp32<<<grid, block>>>(
-                (float*)attn_out_t.data, (float*)attn_flat.data,
-                n_heads, total_seq, head_dim);
+            transpose_split_fused_fp32<<<grid, block>>>(
+                (float*)attn_out_t.data,
+                (float*)txt_attn_out.data, (float*)img_attn_out.data,
+                n_txt, n_img, n_heads, head_dim);
         }
-
-        // Split back into txt and img (FP32)
-        split_seq_fp32((float*)attn_flat.data,
-                       (float*)txt_attn_out.data, (float*)img_attn_out.data,
-                       1, n_txt, n_img, inner_dim);
 
         if (dump_internal_block) {
             dump_internal("attn_out_img.bin", img_attn_out.data, (int64_t)n_img * inner_dim, false);
@@ -746,7 +765,7 @@ Tensor transformer_forward(const TransformerWeights& w,
     img_q.free_data(); img_k.free_data(); img_v.free_data();
     txt_q.free_data(); txt_k.free_data(); txt_v.free_data();
     q_t.free_data(); k_t.free_data(); v_t.free_data();
-    attn_out_t.free_data(); attn_flat.free_data();
+    attn_out_t.free_data();
     img_attn_out.free_data(); txt_attn_out.free_data();
     img_proj.free_data(); txt_proj.free_data();
     img_mlp_fp32.free_data(); txt_mlp_fp32.free_data();
