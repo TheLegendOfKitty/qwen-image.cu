@@ -197,10 +197,20 @@ struct QuantizedWeight {
     Tensor scales4;         // [N, K/group_size] FP32
     Tensor svd_up;          // [N, r] BF16 (L_up = U_r * S_r)
     Tensor svd_down;        // [K, r] BF16 (L_down = V_r)
+    Tensor smooth;          // [K] FP32 — SmoothQuant per-channel factors (optional)
     int group_size;         // INT4 quantization group size
     int svd_rank;           // SVD rank r
+    bool nf4_grid;          // true = NF4 lookup, false = symmetric linear INT4 [-7,7]
 
-    QuantizedWeight() : had_block_size(0), group_size(128), svd_rank(0) {}
+    // --- Nunchaku swizzled INT4 fields ---
+    bool nunchaku_swizzle;  // qweight/scales in MMA-swizzled layout
+    Tensor wscales_bf16;    // [num_groups, N] BF16 swizzled scales
+
+    // --- W4A4 row-major (unswizzled) fields for INT4×INT4 GEMM ---
+    Tensor qweight_rowmajor;    // [N, K/2] UINT8 — row-major packed INT4 (two's complement nibbles)
+    Tensor wscales_rowmajor;    // [num_groups, N] FP32 — row-major weight scales
+
+    QuantizedWeight() : had_block_size(0), group_size(128), svd_rank(0), nf4_grid(true), nunchaku_swizzle(false) {}
     QuantizedWeight(QuantizedWeight&&) = default;
     QuantizedWeight& operator=(QuantizedWeight&&) = default;
 
@@ -211,6 +221,10 @@ struct QuantizedWeight {
         scales4.free_data();
         svd_up.free_data();
         svd_down.free_data();
+        smooth.free_data();
+        wscales_bf16.free_data();
+        qweight_rowmajor.free_data();
+        wscales_rowmajor.free_data();
     }
 };
 
@@ -273,15 +287,67 @@ inline int64_t int8_scratch_bytes(int M, int K, int N) {
 // ================================================================
 
 // Dequantize packed INT4 → BF16
+// nf4_grid: true = NF4 lookup, false = symmetric linear INT4
 void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
                               __nv_bfloat16* out, int N, int K, int group_size,
-                              cudaStream_t stream = 0);
+                              cudaStream_t stream = 0, bool nf4_grid = true,
+                              bool scales_gn = false, bool signed_int4 = false);
+
+// Dequantize nunchaku MMA-swizzled INT4 → BF16
+// qweight: [N, K/2] UINT8 in MMA-swizzled layout
+// wscales: [num_groups, N] BF16 in MMA-swizzled layout
+void dequantize_nunchaku_to_bf16(const uint8_t* qweight, const __nv_bfloat16* wscales,
+                                  __nv_bfloat16* out, int N, int K, int num_groups,
+                                  cudaStream_t stream = 0);
 
 // Quantize FP32 residual → packed INT4 + per-group scales
 void quantize_int4_per_group(const float* residual, uint8_t* qweight, float* scales,
                               int N, int K, int group_size, cudaStream_t stream = 0);
 
+// Dequantize nunchaku AWQ INT4 modulation weights to BF16 with output de-interleaving
+// qweight: [OC/4, IC/2] INT32 (kInterleave=4), wscales/wzeros: [IC/group_size, OC] BF16
+// out: [OC, IC] BF16 in standard (de-interleaved) order
+// num_components: 6 for modulation (shift1,scale1,gate1,shift2,scale2,gate2)
+void dequantize_awq_to_bf16(const int32_t* qweight, const __nv_bfloat16* wscales,
+                              const __nv_bfloat16* wzeros, __nv_bfloat16* out,
+                              int OC, int IC, int group_size, int num_components,
+                              cudaStream_t stream = 0);
+
+// Unswizzle nunchaku MMA-swizzled INT4 weights to row-major layout
+// qweight_swizzled: [N, K/2] UINT8 swizzled, wscales_swizzled: [num_groups, N] BF16 swizzled
+// qweight_rowmajor: [N, K/2] UINT8 row-major, wscales_rowmajor: [num_groups, N] FP32 row-major
+void unswizzle_nunchaku_weights(const uint8_t* qweight_swizzled, const __nv_bfloat16* wscales_swizzled,
+                                 uint8_t* qweight_rowmajor, float* wscales_rowmajor,
+                                 int N, int K, int num_groups, cudaStream_t stream = 0);
+
+// Unswizzle nunchaku MMA-packed LoRA weights to standard row-major BF16
+// packed: [rows, cols] BF16 in MMA fragment-tiled layout
+// standard: [rows, cols] BF16 in standard row-major layout
+// is_down: true for proj_down, false for proj_up
+void unswizzle_lora_weights(const __nv_bfloat16* packed, __nv_bfloat16* standard,
+                             int rows, int cols, bool is_down, cudaStream_t stream = 0);
+
+// Quantize FP32 activations to packed INT4 per-group-of-group_size
+// x: [M, K] FP32 input
+// act_packed: [M, K/2] UINT8 output (two's complement nibbles)
+// act_scales: [num_groups, M] FP32 output (scale per group per token)
+void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_scales,
+                               int M, int K, int group_size, cudaStream_t stream = 0);
+
+// INT4×INT4 GEMM with per-group dequantization
+// act_packed: [M, K/2] UINT8, wgt_packed: [N, K/2] UINT8 (row-major)
+// act_scales: [num_groups, M] FP32, wgt_scales: [num_groups, N] FP32
+// output: [M, N] FP32
+void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
+               const float* act_scales, const float* wgt_scales,
+               float* output, int M, int N, int K, int group_size, cudaStream_t stream = 0);
+
+// Element-wise FP32 add: out[i] = a[i] + b[i]
+void add_fp32(const float* a, const float* b, float* out, int64_t n, cudaStream_t stream = 0);
+
 // INT4+SVD linear: FP32 input × INT4 weight → FP32 output
+// When g_w4a4_mode is true, activations are also quantized to INT4 (simulated W4A4)
+extern bool g_w4a4_mode;
 void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
                           const Tensor* bias, Tensor& out, Tensor& scratch);
 
@@ -297,8 +363,26 @@ QuantizedWeight quantize_weight_tensor_int4(const Tensor& bf16_weight, int rank,
 // GPTQ-guided INT4+SVD quantization (offline tool)
 // Same as above but uses calibration activations to minimize reconstruction error.
 // x_rot: Hadamard-rotated calibration activations [M_total, K] in FP32 (GPU)
+// no_hadamard: skip FWHT rotation on residual (SVDQuant-style)
+// nf4_grid: true = NF4 lookup table, false = symmetric INT4 [-7,7]
+// error_svd: if true, SVD the quantization error instead of the weight (SVDQuant approach)
 QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int rank, int group_size,
-                                                   const float* x_rot_gpu, int M_total, int K);
+                                                   const float* x_rot_gpu, int M_total, int K,
+                                                   bool no_hadamard = false, bool nf4_grid = true,
+                                                   bool error_svd = false);
+
+// GPTQ+Smooth INT4+SVD quantization (offline tool)
+// Takes RAW (non-rotated) calibration activations, computes smooth factors,
+// applies smooth to weight, then runs SVD + GPTQ on the smoothed weight.
+// x_raw_gpu: raw calibration activations [M_total, K] in FP32 (GPU)
+QuantizedWeight quantize_weight_tensor_int4_gptq_smooth(const Tensor& bf16_weight, int rank, int group_size,
+                                                          const float* x_raw_gpu, int M_total, int K);
+
+// Apply smooth division: out[i] = x[i] / smooth[i % K], for x of shape [M, K]
+void apply_smooth_div(const float* x, const float* smooth, float* out, int M, int K, cudaStream_t stream = 0);
+
+// Fused smooth division + FWHT: divides each row by smooth, then applies block-diagonal FWHT in-place
+void smooth_hadamard_inplace(float* data, const float* smooth, int M, int K, int had_block_size, cudaStream_t stream = 0);
 
 // ================================================================
 // GPTQ CALIBRATION DATA READER
@@ -311,6 +395,7 @@ struct CalibrationReader {
         std::vector<__nv_bfloat16> data; // BF16 on CPU
     };
     std::vector<Entry> entries;
+    int version = 1; // 1 = FWHT-rotated activations, 2 = raw activations
 
     bool load(const char* path);
 
@@ -322,11 +407,17 @@ struct CalibrationReader {
 
 // Scratch bytes for INT4 forward
 inline int64_t int4_scratch_bytes(int M, int K, int N, int svd_rank) {
-    int64_t deq_weight = (((int64_t)N * K * 2 + 255) & ~255LL);  // BF16 dequant weight [N,K]
+    // Region A: max of W4A16 (BF16 dequant weight) or W4A4 (act_packed + act_scales + w4a4_out)
+    int64_t regionA_w4a16 = (int64_t)N * K * 2;
+    int num_groups = K / 64; // conservative: smallest group_size = 64
+    int64_t regionA_w4a4 = (((int64_t)M * (K / 2) + 255) & ~255LL)
+                         + (((int64_t)num_groups * M * 4 + 255) & ~255LL)
+                         + (int64_t)M * N * 4;
+    int64_t regionA = (((std::max(regionA_w4a16, regionA_w4a4)) + 255) & ~255LL);
     int64_t fp32_temp  = (((int64_t)M * K * 4 + 255) & ~255LL);  // FP32 temp for Hadamard [M,K]
     int64_t bf16_x     = (((int64_t)M * K * 2 + 255) & ~255LL);  // BF16 input [M,K]
     int64_t lr_inter   = (((int64_t)M * svd_rank * 2 + 255) & ~255LL); // BF16 low-rank tmp [M,r]
-    return deq_weight + fp32_temp + bf16_x + lr_inter;
+    return regionA + fp32_temp + bf16_x + lr_inter;
 }
 
 // ================================================================

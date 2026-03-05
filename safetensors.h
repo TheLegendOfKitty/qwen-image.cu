@@ -88,6 +88,8 @@ public:
                 info.dtype = DType::INT8;
             } else if (dtype_str == "U8" || dtype_str == "uint8") {
                 info.dtype = DType::UINT8;
+            } else if (dtype_str == "I32" || dtype_str == "int32") {
+                info.dtype = DType::INT32;
             } else {
                 fprintf(stderr, "Unknown dtype '%s' for tensor '%s'\n", dtype_str.c_str(), key.c_str());
                 continue;

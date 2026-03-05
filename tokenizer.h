@@ -478,7 +478,8 @@ public:
     }
 
     // Tokenize empty prompt for unconditional (CFG)
+    // Uses single space " " to match diffusers/nunchaku behavior
     std::pair<std::vector<int32_t>, int> tokenize_empty() const {
-        return tokenize_prompt("");
+        return tokenize_prompt(" ");
     }
 };

@@ -63,6 +63,19 @@ void bf16_to_fp16(const __nv_bfloat16* in, __half* out, int64_t n, cudaStream_t 
     bf16_to_fp16_kernel<<<grid, block, 0, stream>>>(in, out, n);
 }
 
+// ==================== Element-wise Subtract ====================
+
+__global__ void elementwise_sub_kernel(float* a, const float* b, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) a[idx] -= b[idx];
+}
+
+void elementwise_sub(float* a, const float* b, int64_t n, cudaStream_t stream = 0) {
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    elementwise_sub_kernel<<<grid, block, 0, stream>>>(a, b, n);
+}
+
 // ==================== RMS Norm ====================
 
 __global__ void rms_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
@@ -2030,6 +2043,73 @@ void fwht_inplace(float* data, int M, int K, int had_block_size, cudaStream_t st
     fwht_inplace_kernel<<<M, threads, 0, stream>>>(data, M, K, had_block_size);
 }
 
+// ==================== Smooth Factor Kernels ====================
+
+// Apply smooth division: out[m,j] = x[m,j] / smooth[j]
+__global__ void apply_smooth_div_kernel(const float* x, const float* smooth, float* out, int M, int K) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < (int64_t)M * K) {
+        int j = (int)(idx % K);
+        out[idx] = x[idx] / smooth[j];
+    }
+}
+
+void apply_smooth_div(const float* x, const float* smooth, float* out, int M, int K, cudaStream_t stream) {
+    int64_t n = (int64_t)M * K;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    apply_smooth_div_kernel<<<grid, block, 0, stream>>>(x, smooth, out, M, K);
+}
+
+// Fused smooth division + FWHT: divides each element by smooth[j], then applies block-diagonal FWHT
+__global__ void smooth_hadamard_kernel(float* data, const float* smooth, int M, int K, int block_size) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    float* row_data = data + (int64_t)row * K;
+
+    // Step 1: Divide by smooth factors
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        row_data[i] /= smooth[i];
+    }
+    __syncthreads();
+
+    // Step 2: FWHT (same as fwht_inplace_kernel)
+    int num_blocks = K / block_size;
+    for (int blk = 0; blk < num_blocks; blk++) {
+        float* bdata = row_data + blk * block_size;
+
+        for (int half = 1; half < block_size; half <<= 1) {
+            int full = half << 1;
+            int num_pairs = block_size / 2;
+
+            for (int pair = threadIdx.x; pair < num_pairs; pair += blockDim.x) {
+                int group = pair / half;
+                int within = pair % half;
+                int idx_a = group * full + within;
+                int idx_b = idx_a + half;
+
+                float a = bdata[idx_a];
+                float b = bdata[idx_b];
+                bdata[idx_a] = a + b;
+                bdata[idx_b] = a - b;
+            }
+            __syncthreads();
+        }
+
+        float norm = rsqrtf((float)block_size);
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+            bdata[i] *= norm;
+        }
+        __syncthreads();
+    }
+}
+
+void smooth_hadamard_inplace(float* data, const float* smooth, int M, int K, int had_block_size, cudaStream_t stream) {
+    int threads = min(1024, max(had_block_size / 2, K / 4));
+    threads = max(32, ((threads + 31) / 32) * 32);
+    smooth_hadamard_kernel<<<M, threads, 0, stream>>>(data, smooth, M, K, had_block_size);
+}
+
 // Warp + block reduction for max value (shared across quantization kernels)
 __device__ float block_reduce_max(float val) {
     // Warp reduce
@@ -2370,12 +2450,189 @@ __device__ __constant__ float NF4_GRID[16] = {
      0.0796f,  0.1609f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f, 1.0f
 };
 
-// Dequantize packed NF4 [N, K/2] + per-group scales [N, K/gs] -> BF16 [N, K]
+// Dequantize packed INT4 [N, K/2] + per-group scales [N, K/gs] -> BF16 [N, K]
+// nf4_grid: true = NF4 lookup, false = symmetric linear INT4 (q-8)*scale
 __global__ void dequantize_int4_to_bf16_kernel(
     const uint8_t* __restrict__ qweight,
     const float* __restrict__ scales,
     __nv_bfloat16* __restrict__ out,
-    int N, int K, int group_size)
+    int N, int K, int group_size, bool nf4_grid, bool scales_gn, bool signed_int4)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    if (idx >= total_bytes) return;
+
+    int row = (int)(idx / (K / 2));
+    int byte_col = (int)(idx % (K / 2));
+
+    uint8_t packed = qweight[idx];
+    int idx0 = packed & 0xF;
+    int idx1 = (packed >> 4) & 0xF;
+
+    int col0 = byte_col * 2;
+    int col1 = byte_col * 2 + 1;
+
+    int num_groups = K / group_size;
+    int g0 = col0 / group_size;
+    int g1 = col1 / group_size;
+    // scales_gn: scales layout is [num_groups, N] instead of [N, num_groups]
+    float s0 = scales_gn ? scales[(int64_t)g0 * N + row] : scales[(int64_t)row * num_groups + g0];
+    float s1 = scales_gn ? scales[(int64_t)g1 * N + row] : scales[(int64_t)row * num_groups + g1];
+
+    if (nf4_grid) {
+        out[(int64_t)row * K + col0] = __float2bfloat16(NF4_GRID[idx0] * s0);
+        out[(int64_t)row * K + col1] = __float2bfloat16(NF4_GRID[idx1] * s1);
+    } else if (signed_int4) {
+        // Two's complement signed INT4: nibble in [0,15] → value in [-8,7]
+        int v0 = idx0 >= 8 ? idx0 - 16 : idx0;
+        int v1 = idx1 >= 8 ? idx1 - 16 : idx1;
+        out[(int64_t)row * K + col0] = __float2bfloat16((float)v0 * s0);
+        out[(int64_t)row * K + col1] = __float2bfloat16((float)v1 * s1);
+    } else {
+        // Unsigned INT4 with zero-point 8: nibble → value = nibble - 8
+        out[(int64_t)row * K + col0] = __float2bfloat16((float)(idx0 - 8) * s0);
+        out[(int64_t)row * K + col1] = __float2bfloat16((float)(idx1 - 8) * s1);
+    }
+}
+
+void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
+                              __nv_bfloat16* out, int N, int K, int group_size,
+                              cudaStream_t stream, bool nf4_grid, bool scales_gn,
+                              bool signed_int4) {
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    int block = 256;
+    int grid = (int)((total_bytes + block - 1) / block);
+    dequantize_int4_to_bf16_kernel<<<grid, block, 0, stream>>>(
+        qweight, scales, out, N, K, group_size, nf4_grid, scales_gn, signed_int4);
+}
+
+// Dequantize nunchaku MMA-swizzled INT4 → BF16
+// Maps logical (row, col) to swizzled byte address + nibble position
+__global__ void dequantize_nunchaku_to_bf16_kernel(
+    const uint8_t* __restrict__ qweight,
+    const __nv_bfloat16* __restrict__ wscales,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K, int num_groups)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * K;
+    if (idx >= total) return;
+
+    int row = (int)(idx / K);
+    int col = (int)(idx % K);
+    int group_size = K / num_groups;
+    int group = col / group_size;
+
+    // Weight index: (row, col) → swizzled byte address + nibble
+    int k_tiles = K / 64;
+    int n_tile = row / 128;
+    int nw = row % 128;
+    int np = nw / 16;
+    int ps = (nw % 16) / 8;
+    int nl = nw % 8;
+
+    int k_tile = col / 64;
+    int kps = (col % 64) / 32;
+    int kl = ((col % 64) % 32) / 8;
+    int rk = (col % 64) % 8;
+
+    int int32_idx = n_tile * (k_tiles * 1024) + k_tile * 1024
+                  + np * 128 + nl * 16 + kl * 4 + ps * 2 + kps;
+    int byte_offset = int32_idx * 4 + rk / 2;
+    int nibble = (qweight[byte_offset] >> ((rk % 2) * 4)) & 0xF;
+
+    // Two's complement signed 4-bit
+    int signed_val = nibble >= 8 ? nibble - 16 : nibble;
+
+    // Scale index: (row, group) → swizzled BF16 offset
+    int d2 = nw / 16;
+    int d3 = (nw % 16) / 8;
+    int d4 = (nw % 8) / 2;
+    int d5 = nw % 2;
+    int scale_offset = n_tile * num_groups * 128 + group * 128
+                     + d2 * 16 + d4 * 4 + d3 * 2 + d5;
+
+    float scale = __bfloat162float(wscales[scale_offset]);
+    out[idx] = __float2bfloat16((float)signed_val * scale);
+}
+
+void dequantize_nunchaku_to_bf16(const uint8_t* qweight, const __nv_bfloat16* wscales,
+                                  __nv_bfloat16* out, int N, int K, int num_groups,
+                                  cudaStream_t stream) {
+    int64_t total = (int64_t)N * K;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    dequantize_nunchaku_to_bf16_kernel<<<grid, block, 0, stream>>>(
+        qweight, wscales, out, N, K, num_groups);
+}
+
+// ==================== AWQ INT4 Dequantization (for modulation layers) ====================
+// Dequantize nunchaku AWQ INT4 modulation weights to BF16 with output de-interleaving.
+// AWQ packing: qweight [OC/4, IC/2] INT32, kInterleave=4.
+//   pack_w4 packing layout (from nunchaku tinychat_utils.py):
+//     qw_row = oc / 4
+//     int16_col = (ic/64)*64 + (oc%4)*16 + ((ic%64)/32)*8 + (ic%8)
+//     qw_col = int16_col / 2
+//     bit_offset = (int16_col % 2) * 16 + ((ic/8) % 4) * 4
+//     q = (qweight[qw_row, qw_col] >> bit_offset) & 0xF
+// Dequant: weight = q_uint4 * wscales[ic/group_size, oc] + wzeros[ic/group_size, oc]
+// De-interleave: nk_oc → component = nk_oc % num_components, feature = nk_oc / num_components
+//   standard_oc = component * (OC/num_components) + feature
+__global__ void dequantize_awq_to_bf16_kernel(
+    const int32_t* __restrict__ qweight,   // [OC/4, IC/2]
+    const __nv_bfloat16* __restrict__ wscales, // [IC/group_size, OC]
+    const __nv_bfloat16* __restrict__ wzeros,  // [IC/group_size, OC]
+    __nv_bfloat16* __restrict__ out,       // [OC, IC] in standard (de-interleaved) order
+    int OC, int IC, int group_size, int num_components)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)OC * IC;
+    if (idx >= total) return;
+
+    // Map to standard (de-interleaved) output position
+    int std_oc = (int)(idx / IC);
+    int ic = (int)(idx % IC);
+
+    // Convert standard_oc to nunchaku interleaved oc
+    int dim = OC / num_components;  // 3072 for 6-way modulation
+    int component = std_oc / dim;
+    int feature = std_oc % dim;
+    int nk_oc = feature * num_components + component;
+
+    // AWQ kInterleave=4 packing: extract nibble from packed qweight
+    int qw_row = nk_oc / 4;
+    int int16_col = (ic / 64) * 64 + (nk_oc % 4) * 16 + ((ic % 64) / 32) * 8 + (ic % 8);
+    int qw_col = int16_col / 2;
+    int bit_offset = (int16_col % 2) * 16 + ((ic / 8) % 4) * 4;
+    int packed_val = qweight[qw_row * (IC / 2) + qw_col];
+    int q = (packed_val >> bit_offset) & 0xF;  // unsigned 0..15
+
+    // Dequantize: weight = q * scale + zero (wzeros is pre-scaled)
+    int group = ic / group_size;
+    float scale = __bfloat162float(wscales[group * OC + nk_oc]);
+    float zero = __bfloat162float(wzeros[group * OC + nk_oc]);
+    float weight = (float)q * scale + zero;
+
+    out[idx] = __float2bfloat16(weight);
+}
+
+void dequantize_awq_to_bf16(const int32_t* qweight, const __nv_bfloat16* wscales,
+                              const __nv_bfloat16* wzeros, __nv_bfloat16* out,
+                              int OC, int IC, int group_size, int num_components,
+                              cudaStream_t stream) {
+    int64_t total = (int64_t)OC * IC;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    dequantize_awq_to_bf16_kernel<<<grid, block, 0, stream>>>(
+        qweight, wscales, wzeros, out, OC, IC, group_size, num_components);
+}
+
+// Dequantize packed INT4 [N, K/2] + per-group scales [N, K/gs] -> FP32 [N, K]
+__global__ void dequantize_int4_to_fp32_kernel(
+    const uint8_t* __restrict__ qweight,
+    const float* __restrict__ scales,
+    float* __restrict__ out,
+    int N, int K, int group_size, bool nf4_grid)
 {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total_bytes = (int64_t)N * (K / 2);
@@ -2395,18 +2652,87 @@ __global__ void dequantize_int4_to_bf16_kernel(
     float s0 = scales[(int64_t)row * num_groups + col0 / group_size];
     float s1 = scales[(int64_t)row * num_groups + col1 / group_size];
 
-    out[(int64_t)row * K + col0] = __float2bfloat16(NF4_GRID[idx0] * s0);
-    out[(int64_t)row * K + col1] = __float2bfloat16(NF4_GRID[idx1] * s1);
+    if (nf4_grid) {
+        out[(int64_t)row * K + col0] = NF4_GRID[idx0] * s0;
+        out[(int64_t)row * K + col1] = NF4_GRID[idx1] * s1;
+    } else {
+        out[(int64_t)row * K + col0] = (float)(idx0 - 8) * s0;
+        out[(int64_t)row * K + col1] = (float)(idx1 - 8) * s1;
+    }
 }
 
-void dequantize_int4_to_bf16(const uint8_t* qweight, const float* scales,
-                              __nv_bfloat16* out, int N, int K, int group_size,
-                              cudaStream_t stream) {
+static void dequantize_int4_to_fp32(const uint8_t* qweight, const float* scales,
+                                     float* out, int N, int K, int group_size,
+                                     bool nf4_grid, cudaStream_t stream = 0) {
     int64_t total_bytes = (int64_t)N * (K / 2);
     int block = 256;
     int grid = (int)((total_bytes + block - 1) / block);
-    dequantize_int4_to_bf16_kernel<<<grid, block, 0, stream>>>(
-        qweight, scales, out, N, K, group_size);
+    dequantize_int4_to_fp32_kernel<<<grid, block, 0, stream>>>(
+        qweight, scales, out, N, K, group_size, nf4_grid);
+}
+
+// Quantize FP32 residual [N, K] to packed symmetric INT4 [N, K/2] + per-group scales [N, K/gs]
+// Symmetric linear INT4: scale = max(|group|)/7, q = round(x/scale)+8, clamp [0,15]
+__global__ void quantize_linear_int4_per_group_kernel(
+    const float* __restrict__ residual,
+    uint8_t* __restrict__ qweight,
+    float* __restrict__ scales,
+    int N, int K, int group_size)
+{
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    if (row >= N) return;
+
+    int num_groups = K / group_size;
+    int col_start = group * group_size;
+    const float* grp = residual + (int64_t)row * K + col_start;
+
+    // Find max abs in group (same reduction as NF4 kernel)
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = fabsf(grp[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    __shared__ float s_max[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) s_max[warp_id] = max_abs;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_max[0] = max_abs;
+    __syncthreads();
+    max_abs = s_max[0];
+
+    // Scale = max/7 (step size for [-7,7] range)
+    float scale = max_abs / 7.0f;
+    if (threadIdx.x == 0)
+        scales[(int64_t)row * num_groups + group] = scale;
+
+    float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+
+    // Quantize pairs and pack
+    int half_gs = group_size / 2;
+    for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
+        int c0 = col_start + i * 2;
+        int c1 = c0 + 1;
+        float v0 = residual[(int64_t)row * K + c0] * inv_scale;
+        float v1 = residual[(int64_t)row * K + c1] * inv_scale;
+
+        // Round and clamp to [-7, 7], then offset to unsigned [1, 15]
+        int q0 = (int)roundf(v0); q0 = max(-7, min(7, q0)); q0 += 8;
+        int q1 = (int)roundf(v1); q1 = max(-7, min(7, q1)); q1 += 8;
+
+        uint8_t packed = (uint8_t)(q0 | (q1 << 4));
+        qweight[(int64_t)row * (K / 2) + (c0 / 2)] = packed;
+    }
 }
 
 // Quantize FP32 residual [N, K] to packed NF4 [N, K/2] + per-group scales [N, K/gs]
@@ -2490,6 +2816,438 @@ void quantize_int4_per_group(const float* residual, uint8_t* qweight, float* sca
         residual, qweight, scales, N, K, group_size);
 }
 
+// Simulate W4A4 activation quantization: quantize FP32 to symmetric INT4 per-token-per-group
+// and immediately dequantize back to FP32 (adds quantization noise in-place).
+__global__ void act_quant_noise_int4_kernel(
+    float* __restrict__ data, int M, int K, int group_size)
+{
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    if (row >= M) return;
+
+    int col_start = group * group_size;
+    float* grp = data + (int64_t)row * K + col_start;
+
+    // Find max abs in group (warp-reduce)
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = fabsf(grp[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    __shared__ float s_max[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) s_max[warp_id] = max_abs;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_max[0] = max_abs;
+    __syncthreads();
+    max_abs = s_max[0];
+
+    float scale = max_abs / 7.0f;
+    float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+
+    // Quantize to [-7,7] and dequantize in-place
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = grp[i];
+        float q = roundf(v * inv_scale);
+        q = fminf(7.0f, fmaxf(-7.0f, q));
+        grp[i] = q * scale;
+    }
+}
+
+static void act_quant_noise_int4(float* data, int M, int K, int group_size, cudaStream_t stream = 0) {
+    int num_groups = K / group_size;
+    dim3 grid(M, num_groups);
+    int block = min(256, group_size);
+    act_quant_noise_int4_kernel<<<grid, block, 0, stream>>>(data, M, K, group_size);
+}
+
+// ================================================================
+// W4A4 KERNELS: INT4×INT4 GEMM with per-group dequantization
+// ================================================================
+
+// Kernel A: Unswizzle nunchaku MMA-swizzled INT4 weights to row-major
+// Reuses swizzle index formulas from dequantize_nunchaku_to_bf16_kernel
+// Each thread handles one (row, col_pair) = two adjacent columns → one output byte
+__global__ void unswizzle_nunchaku_weights_kernel(
+    const uint8_t* __restrict__ qweight_swizzled,
+    const __nv_bfloat16* __restrict__ wscales_swizzled,
+    uint8_t* __restrict__ qweight_rowmajor,
+    float* __restrict__ wscales_rowmajor,
+    int N, int K, int num_groups)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    if (idx >= total_bytes) return;
+
+    int row = (int)(idx / (K / 2));
+    int byte_col = (int)(idx % (K / 2));
+    int col0 = byte_col * 2;
+    int col1 = col0 + 1;
+
+    int k_tiles = K / 64;
+    int n_tile = row / 128;
+    int nw = row % 128;
+    int np = nw / 16;
+    int ps = (nw % 16) / 8;
+    int nl = nw % 8;
+
+    // Helper lambda for swizzled nibble read
+    auto read_nibble = [&](int col) -> int {
+        int k_tile = col / 64;
+        int kps = (col % 64) / 32;
+        int kl = ((col % 64) % 32) / 8;
+        int rk = (col % 64) % 8;
+
+        int int32_idx = n_tile * (k_tiles * 1024) + k_tile * 1024
+                      + np * 128 + nl * 16 + kl * 4 + ps * 2 + kps;
+        int byte_offset = int32_idx * 4 + rk / 2;
+        return (qweight_swizzled[byte_offset] >> ((rk % 2) * 4)) & 0xF;
+    };
+
+    int nib0 = read_nibble(col0);
+    int nib1 = read_nibble(col1);
+
+    // Pack: low nibble = even col, high nibble = odd col
+    qweight_rowmajor[idx] = (uint8_t)(nib0 | (nib1 << 4));
+
+    // Unswizzle scale for the group containing col0 (once per group boundary)
+    int group_size = K / num_groups;
+    int group = col0 / group_size;
+    if (col0 % group_size == 0) {
+        int d2 = nw / 16;
+        int d3 = (nw % 16) / 8;
+        int d4 = (nw % 8) / 2;
+        int d5 = nw % 2;
+        int scale_offset = n_tile * num_groups * 128 + group * 128
+                         + d2 * 16 + d4 * 4 + d3 * 2 + d5;
+
+        float scale = __bfloat162float(wscales_swizzled[scale_offset]);
+        wscales_rowmajor[group * N + row] = scale;
+    }
+}
+
+void unswizzle_nunchaku_weights(const uint8_t* qweight_swizzled, const __nv_bfloat16* wscales_swizzled,
+                                 uint8_t* qweight_rowmajor, float* wscales_rowmajor,
+                                 int N, int K, int num_groups, cudaStream_t stream) {
+    int64_t total_bytes = (int64_t)N * (K / 2);
+    int block = 256;
+    int grid = (int)((total_bytes + block - 1) / block);
+    unswizzle_nunchaku_weights_kernel<<<grid, block, 0, stream>>>(
+        qweight_swizzled, wscales_swizzled, qweight_rowmajor, wscales_rowmajor, N, K, num_groups);
+}
+
+// Kernel: Unswizzle nunchaku MMA-packed LoRA weights to standard row-major BF16
+// Nunchaku stores proj_down and proj_up in MMA fragment-tiled layout (16×16 tiles with
+// lane permutations). This kernel converts to standard row-major for use with cuBLAS.
+// is_down: true for proj_down [K, r], false for proj_up [N, r]
+__global__ void unswizzle_lora_weights_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16* __restrict__ output,
+    int rows, int cols, bool is_down)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)rows * cols;
+    if (idx >= total) return;
+
+    int row = (int)(idx / cols);
+    int col = (int)(idx % cols);
+
+    // Nunchaku MMA-packed LoRA weights use 16×16 fragment tiling with lane permutations.
+    // Packed tensor is viewed as 7D: [C/16, R/16, 8, 4, 2, 2, 2] where R = cols (second dim).
+    //
+    // For is_down=true: packed [K, rank], output [K, rank] = lora_down.T (for cuBLAS).
+    //   The standard (unpacked) lora_down has shape [rank, K], so:
+    //   output[row, col] = standard[col, row] → swap row/col for standard indices.
+    //
+    // For is_down=false: packed [N, rank], output [N, rank] = lora_up (direct).
+    //   output[row, col] = standard[row, col] → no swap needed.
+    int R = cols;  // second dim of packed tensor
+    int s_row, s_col;
+    if (is_down) {
+        s_row = col;  // standard row = output col
+        s_col = row;  // standard col = output row
+    } else {
+        s_row = row;
+        s_col = col;
+    }
+
+    // Packed tensor is [C/16, R/16, ...] where C is first dim, R is second dim.
+    // For is_down=true:  packed [K, rank] → s_row=rank axis (n), s_col=K axis (k)
+    //   c_frag = s_col/16 (K tiles), r_frag = s_row/16 (rank tiles)
+    // For is_down=false: packed [N, rank] → s_row=N axis (n), s_col=rank axis (k)
+    //   c_frag = s_row/16 (N tiles), r_frag = s_col/16 (rank tiles)
+    int c_frag, r_frag;
+    if (is_down) {
+        c_frag = s_col / 16;  // K tiles
+        r_frag = s_row / 16;  // rank tiles
+    } else {
+        c_frag = s_row / 16;  // N tiles
+        r_frag = s_col / 16;  // rank tiles
+    }
+    int local_n = s_row % 16;
+    int local_k = s_col % 16;
+
+    // 7D view of inner [frag_n=16, frag_k=16] block:
+    //   [n_pack(2), n_lanes(8), k_pack(2), k_lanes(4), lk(2)]
+    // local_n = np * 8 + nl,  local_k = kp * 8 + kl * 2 + lk
+    int np = local_n / 8;
+    int nl = local_n % 8;
+    int kp = local_k / 8;
+    int kl = (local_k % 8) / 2;
+    int lk = local_k % 2;
+
+    // After pack permute (0,1,3,5,2,4,6): strides nl(32) kl(8) np(4) kp(2) lk(1)
+    int64_t flat_packed = (int64_t)c_frag * 16 * R + r_frag * 256 + nl * 32 + kl * 8 + np * 4 + kp * 2 + lk;
+    output[idx] = packed[flat_packed];
+}
+
+void unswizzle_lora_weights(const __nv_bfloat16* packed, __nv_bfloat16* standard,
+                             int rows, int cols, bool is_down, cudaStream_t stream) {
+    int64_t total = (int64_t)rows * cols;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    unswizzle_lora_weights_kernel<<<grid, block, 0, stream>>>(packed, standard, rows, cols, is_down);
+}
+
+// Kernel B: Quantize FP32 activations to packed INT4 per-group
+// Grid: (M, num_groups), Block: min(256, group_size)
+// act_scales layout: [num_groups, M] — scale for group g, token m at act_scales[g * M + m]
+__global__ void quantize_activation_int4_kernel(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ act_packed,
+    float* __restrict__ act_scales,
+    int M, int K, int group_size)
+{
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    if (row >= M) return;
+
+    int col_start = group * group_size;
+    const float* grp = x + (int64_t)row * K + col_start;
+
+    // Find max abs in group (warp-reduce + cross-warp reduce)
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = fabsf(grp[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    __shared__ float s_max[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) s_max[warp_id] = max_abs;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_max[0] = max_abs;
+    __syncthreads();
+    max_abs = s_max[0];
+
+    float scale = max_abs / 7.0f;
+    float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+
+    // Store scale: [num_groups, M] layout
+    int num_groups = K / group_size;
+    if (threadIdx.x == 0)
+        act_scales[group * M + row] = scale;
+
+    // Quantize pairs and pack into bytes
+    // Two's complement nibble: val & 0xF (for val in [-7,7], this gives [0x9..0xF,0x0..0x7])
+    int half_gs = group_size / 2;
+    for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
+        int c0 = col_start + i * 2;
+        int c1 = c0 + 1;
+        float v0 = x[(int64_t)row * K + c0] * inv_scale;
+        float v1 = x[(int64_t)row * K + c1] * inv_scale;
+
+        int q0 = (int)roundf(v0); q0 = max(-7, min(7, q0));
+        int q1 = (int)roundf(v1); q1 = max(-7, min(7, q1));
+
+        // Pack as two's complement nibbles: low nibble = even, high = odd
+        uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+        act_packed[(int64_t)row * (K / 2) + c0 / 2] = packed;
+    }
+}
+
+void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_scales,
+                               int M, int K, int group_size, cudaStream_t stream) {
+    int num_groups = K / group_size;
+    dim3 grid(M, num_groups);
+    int block = min(256, group_size);
+    quantize_activation_int4_kernel<<<grid, block, 0, stream>>>(
+        x, act_packed, act_scales, M, K, group_size);
+}
+
+// Kernel C: Tiled INT4×INT4 GEMM with per-group dequantization
+// Block tile: BM×BN output tile, each thread computes TM×TN outputs
+// Shared memory loads weight tiles cooperatively
+// act_packed: [M, K/2] UINT8, wgt_packed: [N, K/2] UINT8
+// act_scales: [num_groups, M] FP32, wgt_scales: [num_groups, N] FP32
+// output: [M, N] FP32
+
+#define W4A4_BM 32
+#define W4A4_BN 64
+#define W4A4_BK 64  // = group_size, process one group at a time
+#define W4A4_TM 4   // each thread computes 4 rows
+#define W4A4_TN 4   // each thread computes 4 cols
+
+__global__ void w4a4_gemm_kernel(
+    const uint8_t* __restrict__ act_packed,
+    const uint8_t* __restrict__ wgt_packed,
+    const float* __restrict__ act_scales,
+    const float* __restrict__ wgt_scales,
+    float* __restrict__ output,
+    int M, int N, int K, int group_size)
+{
+    // Block output tile: rows [bm, bm+BM), cols [bn, bn+BN)
+    int bm = blockIdx.y * W4A4_BM;
+    int bn = blockIdx.x * W4A4_BN;
+
+    // Thread position within block
+    int tid = threadIdx.x;
+    int threads_per_block = (W4A4_BM / W4A4_TM) * (W4A4_BN / W4A4_TN); // 8*16=128
+    int ty = tid / (W4A4_BN / W4A4_TN); // row of thread tile
+    int tx = tid % (W4A4_BN / W4A4_TN); // col of thread tile
+
+    int num_groups = K / group_size;
+    int half_gs = group_size / 2; // bytes per group
+
+    // Shared memory for weight tile: [BN, half_gs] bytes
+    // and activation tile: [BM, half_gs] bytes
+    __shared__ uint8_t s_wgt[W4A4_BN][W4A4_BK / 2]; // 64 × 32 = 2048 bytes
+    __shared__ uint8_t s_act[W4A4_BM][W4A4_BK / 2]; // 32 × 32 = 1024 bytes
+
+    // Accumulators
+    float acc[W4A4_TM][W4A4_TN];
+    for (int i = 0; i < W4A4_TM; i++)
+        for (int j = 0; j < W4A4_TN; j++)
+            acc[i][j] = 0.0f;
+
+    for (int g = 0; g < num_groups; g++) {
+        int k_byte_start = g * half_gs;
+
+        // Cooperatively load weight tile [BN, half_gs] into shared mem
+        // Total bytes: BN * half_gs = 64 * 32 = 2048, threads = 128, each loads 16 bytes
+        for (int idx = tid; idx < W4A4_BN * half_gs; idx += threads_per_block) {
+            int wn = idx / half_gs;
+            int wb = idx % half_gs;
+            int gn = bn + wn;
+            s_wgt[wn][wb] = (gn < N) ? wgt_packed[(int64_t)gn * (K / 2) + k_byte_start + wb] : 0;
+        }
+
+        // Cooperatively load activation tile [BM, half_gs]
+        for (int idx = tid; idx < W4A4_BM * half_gs; idx += threads_per_block) {
+            int am = idx / half_gs;
+            int ab = idx % half_gs;
+            int gm = bm + am;
+            s_act[am][ab] = (gm < M) ? act_packed[(int64_t)gm * (K / 2) + k_byte_start + ab] : 0;
+        }
+
+        __syncthreads();
+
+        // Each thread computes TM×TN partial INT32 dot products
+        int partial[W4A4_TM][W4A4_TN];
+        for (int i = 0; i < W4A4_TM; i++)
+            for (int j = 0; j < W4A4_TN; j++)
+                partial[i][j] = 0;
+
+        for (int kb = 0; kb < half_gs; kb++) {
+            // Load and unpack activation bytes for TM rows
+            int a_vals[W4A4_TM][2];
+            for (int i = 0; i < W4A4_TM; i++) {
+                uint8_t ab = s_act[ty * W4A4_TM + i][kb];
+                int a0 = ab & 0xF;
+                int a1 = (ab >> 4) & 0xF;
+                a_vals[i][0] = (a0 >= 8) ? (a0 - 16) : a0;
+                a_vals[i][1] = (a1 >= 8) ? (a1 - 16) : a1;
+            }
+
+            // Load and unpack weight bytes for TN cols
+            int w_vals[W4A4_TN][2];
+            for (int j = 0; j < W4A4_TN; j++) {
+                uint8_t wb = s_wgt[tx * W4A4_TN + j][kb];
+                int w0 = wb & 0xF;
+                int w1 = (wb >> 4) & 0xF;
+                w_vals[j][0] = (w0 >= 8) ? (w0 - 16) : w0;
+                w_vals[j][1] = (w1 >= 8) ? (w1 - 16) : w1;
+            }
+
+            // Accumulate
+            for (int i = 0; i < W4A4_TM; i++)
+                for (int j = 0; j < W4A4_TN; j++)
+                    partial[i][j] += a_vals[i][0] * w_vals[j][0] + a_vals[i][1] * w_vals[j][1];
+        }
+
+        // Dequantize and accumulate into FP32
+        for (int i = 0; i < W4A4_TM; i++) {
+            int gm = bm + ty * W4A4_TM + i;
+            if (gm >= M) continue;
+            float as = act_scales[g * M + gm];
+            for (int j = 0; j < W4A4_TN; j++) {
+                int gn = bn + tx * W4A4_TN + j;
+                if (gn >= N) continue;
+                float ws = wgt_scales[g * N + gn];
+                acc[i][j] += (float)partial[i][j] * as * ws;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output
+    for (int i = 0; i < W4A4_TM; i++) {
+        int gm = bm + ty * W4A4_TM + i;
+        if (gm >= M) continue;
+        for (int j = 0; j < W4A4_TN; j++) {
+            int gn = bn + tx * W4A4_TN + j;
+            if (gn >= N) continue;
+            output[(int64_t)gm * N + gn] = acc[i][j];
+        }
+    }
+}
+
+void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
+               const float* act_scales, const float* wgt_scales,
+               float* output, int M, int N, int K, int group_size, cudaStream_t stream) {
+    // BM=32, BN=64, TM=4, TN=4 → threads = (32/4)*(64/4) = 8*16 = 128
+    dim3 block(128);
+    dim3 grid((N + W4A4_BN - 1) / W4A4_BN, (M + W4A4_BM - 1) / W4A4_BM);
+    w4a4_gemm_kernel<<<grid, block, 0, stream>>>(
+        act_packed, wgt_packed, act_scales, wgt_scales, output, M, N, K, group_size);
+}
+
+// Simple FP32 element-wise add
+__global__ void add_fp32_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                 float* __restrict__ out, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = a[idx] + b[idx];
+}
+
+void add_fp32(const float* a, const float* b, float* out, int64_t n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    add_fp32_kernel<<<grid, block, 0, stream>>>(a, b, out, n);
+}
+
+// Global flag: simulate W4A4 by adding INT4 activation quantization noise
+bool g_w4a4_mode = false;
+
 // INT4+SVD linear forward: FP32 input, INT4 weight -> FP32 output
 // out = x @ R_dequant^T + x @ svd_down @ svd_up^T + bias
 void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
@@ -2499,8 +3257,10 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     assert(weight.mode == QuantMode::INT4_SVD);
 
     int M = (int)x.shape[0];
-    int N = (int)weight.qweight.shape[0];
-    int K = (int)(weight.qweight.shape[1] * 2);
+    // Use rowmajor tensors for dimensions when swizzled originals are freed
+    const Tensor& qw_ref = weight.qweight_rowmajor.data ? weight.qweight_rowmajor : weight.qweight;
+    int N = (int)qw_ref.shape[0];
+    int K = (int)(qw_ref.shape[1] * 2);
     int r = weight.svd_rank;
 
     // Scratch layout (256-byte aligned regions):
@@ -2519,8 +3279,16 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
 
     float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
 
-    // 1. Convert FP32 input -> BF16 [M, K] (original, non-rotated)
-    fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+    bool has_smooth = (weight.smooth.data != nullptr);
+
+    // 1. Low-rank path: x → /smooth → BF16 → low-rank GEMMs → out
+    if (has_smooth) {
+        // Apply smooth division in FP32, then convert to BF16
+        apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
+        fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
+    } else {
+        fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+    }
 
     // 2. Low-rank down: lr_tmp[M,r] = bf16_x[M,K] @ svd_down[K,r]
     CUBLAS_CHECK(cublasGemmEx(cublas(),
@@ -2542,30 +3310,168 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
         (float*)out.data, CUDA_R_32F, N,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-    // 4. Hadamard-rotate input for residual path: copy x to FP32 temp, apply FWHT
-    CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
-    if (weight.had_block_size > 1) {
-        fwht_inplace(fp32_tmp, M, K, weight.had_block_size);
+    // 4. Residual path — two modes:
+    //   W4A4 (nunchaku_swizzle): quantize activations to INT4, INT4×INT4 GEMM
+    //   W4A16 (default): dequant weights to BF16, BF16×BF16 GEMM
+    if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data && !getenv("FORCE_W4A16")) {
+        static int w4a4_count = 0;
+        if (w4a4_count < 2) {
+            fprintf(stderr, "  [W4A4 path] M=%d K=%d N=%d r=%d gs=%d smooth=%d\n",
+                    M, K, N, r, weight.group_size, has_smooth ? 1 : 0);
+            w4a4_count++;
+        }
+        // W4A4 path: fp32_tmp already has smooth-divided activations from step 1
+        // (fp32_tmp was used for smooth_div → bf16 conversion; recompute smooth here)
+        if (has_smooth) {
+            apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
+        } else {
+            CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float),
+                                   cudaMemcpyDeviceToDevice));
+        }
+
+        // Reuse region A (deq_w area, N*K*2 bytes) for act_packed and act_scales
+        // act_packed: [M, K/2] bytes, act_scales: [num_groups, M] * 4 bytes
+        int num_groups = K / weight.group_size;
+        uint8_t* act_packed = (uint8_t*)deq_w;
+        float* act_scales_ptr = (float*)((char*)act_packed + (((int64_t)M * (K / 2) + 255) & ~255LL));
+
+        quantize_activation_int4(fp32_tmp, act_packed, act_scales_ptr, M, K, weight.group_size);
+
+        // W4A4 GEMM → write to fp32_tmp (reuse as [M, N] output buffer)
+        // fp32_tmp is [M, K] = M*K*4 bytes, and we need [M, N] = M*N*4 bytes
+        // For nunchaku layers K >= N typically, so this fits.
+        // But to be safe, use a separate region. Region after act_scales:
+        float* w4a4_out = (float*)((char*)act_scales_ptr + (((int64_t)num_groups * M * 4 + 255) & ~255LL));
+
+        w4a4_gemm(act_packed, (uint8_t*)weight.qweight_rowmajor.data,
+                  act_scales_ptr, (float*)weight.wscales_rowmajor.data,
+                  w4a4_out, M, N, K, weight.group_size);
+
+        // Debug: verify W4A4 GEMM output against dequant+FP32 reference for one element
+        static int w4a4_check_count = 0;
+        if (getenv("VERIFY_W4A4") && w4a4_check_count < 3) {
+            w4a4_check_count++;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            // Download small amounts of data to CPU for verification
+            int check_m = 0, check_n = 0;
+            // Dequantize weight[check_n, :] and activation[check_m, :], compute dot product
+            std::vector<uint8_t> wgt_row(K / 2);
+            CUDA_CHECK(cudaMemcpy(wgt_row.data(), (uint8_t*)weight.qweight_rowmajor.data + (int64_t)check_n * (K/2),
+                                   K / 2, cudaMemcpyDeviceToHost));
+            std::vector<float> wgt_scales_cpu(num_groups);
+            for (int g = 0; g < num_groups; g++) {
+                float s;
+                CUDA_CHECK(cudaMemcpy(&s, (float*)weight.wscales_rowmajor.data + g * N + check_n,
+                                       sizeof(float), cudaMemcpyDeviceToHost));
+                wgt_scales_cpu[g] = s;
+            }
+            std::vector<float> act_cpu(K);
+            CUDA_CHECK(cudaMemcpy(act_cpu.data(), fp32_tmp + (int64_t)check_m * K,
+                                   K * sizeof(float), cudaMemcpyDeviceToHost));
+
+            // Reference FP32 computation: dequant weights and dot product
+            double ref_dot = 0;
+            int gs = weight.group_size;
+            for (int g = 0; g < num_groups; g++) {
+                float ws = wgt_scales_cpu[g];
+                for (int k = 0; k < gs; k++) {
+                    int col = g * gs + k;
+                    int byte_idx = col / 2;
+                    int nibble = (col % 2 == 0) ? (wgt_row[byte_idx] & 0xF) : ((wgt_row[byte_idx] >> 4) & 0xF);
+                    int w_int = (nibble >= 8) ? (nibble - 16) : nibble;
+                    float w_deq = (float)w_int * ws;
+                    ref_dot += (double)act_cpu[col] * w_deq;
+                }
+            }
+
+            // W4A4 GEMM output for (check_m, check_n)
+            float w4a4_val;
+            CUDA_CHECK(cudaMemcpy(&w4a4_val, w4a4_out + (int64_t)check_m * N + check_n,
+                                   sizeof(float), cudaMemcpyDeviceToHost));
+
+            // LoRA output for (check_m, check_n)
+            float lora_val;
+            CUDA_CHECK(cudaMemcpy(&lora_val, (float*)out.data + (int64_t)check_m * N + check_n,
+                                   sizeof(float), cudaMemcpyDeviceToHost));
+
+            fprintf(stderr, "  W4A4 VERIFY [%d] M=%d K=%d N=%d gs=%d: "
+                    "w4a4[0,0]=%.6f ref_deq=%.6f lora[0,0]=%.6f sum=%.6f\n",
+                    w4a4_check_count, M, K, N, gs,
+                    w4a4_val, (float)ref_dot, lora_val, w4a4_val + lora_val);
+            // Also print weight scale stats
+            double ws_sum = 0, ws_max = 0;
+            for (int g = 0; g < num_groups; g++) { ws_sum += wgt_scales_cpu[g]; ws_max = std::max(ws_max, (double)wgt_scales_cpu[g]); }
+            fprintf(stderr, "    wscales: mean=%.6f max=%.6f  act[0:5]=%.4f %.4f %.4f %.4f %.4f\n",
+                    ws_sum / num_groups, ws_max, act_cpu[0], act_cpu[1], act_cpu[2], act_cpu[3], act_cpu[4]);
+        }
+
+        // Accumulate: out += w4a4_out
+        add_fp32((float*)out.data, w4a4_out, (float*)out.data, (int64_t)M * N);
+    } else if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data) {
+        // W4A16 fallback for nunchaku (FORCE_W4A16): dequant unswizzled → BF16 GEMM
+        static int w4a16_fb = 0;
+        if (w4a16_fb < 2) { fprintf(stderr, "  [W4A16-nunchaku fallback] M=%d K=%d N=%d\n", M, K, N); w4a16_fb++; }
+
+        if (has_smooth) {
+            apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
+        } else {
+            CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
+
+        // Dequantize row-major INT4 → BF16 using unswizzled weights & scales
+        // wscales_rowmajor is [num_groups, N] layout (scales_gn=true)
+        // nunchaku uses signed INT4 two's complement (signed_int4=true)
+        int num_groups = K / weight.group_size;
+        dequantize_int4_to_bf16(
+            (uint8_t*)weight.qweight_rowmajor.data, (float*)weight.wscales_rowmajor.data,
+            deq_w, N, K, weight.group_size, 0, false, true, true);
+
+        // Residual GEMM: out[M,N] += bf16_x[M,K] @ deq_w[N,K]^T  (beta=1, accumulate)
+        CUBLAS_CHECK(cublasGemmEx(cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K, &alpha,
+            deq_w,  CUDA_R_16BF, K,
+            bf16_x, CUDA_R_16BF, K,
+            &beta1,
+            (float*)out.data, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else {
+        // W4A16 path (original non-nunchaku)
+        CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float),
+                               cudaMemcpyDeviceToDevice));
+        if (has_smooth && weight.had_block_size > 1) {
+            smooth_hadamard_inplace(fp32_tmp, (const float*)weight.smooth.data, M, K, weight.had_block_size);
+        } else if (has_smooth) {
+            apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
+        } else if (weight.had_block_size > 1) {
+            fwht_inplace(fp32_tmp, M, K, weight.had_block_size);
+        }
+
+        // W4A4 noise simulation (legacy)
+        if (g_w4a4_mode) {
+            act_quant_noise_int4(fp32_tmp, M, K, weight.group_size);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // Convert rotated FP32 -> BF16 (reuse region C)
+        fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
+
+        // Dequantize INT4 packed [N, K/2] -> BF16 [N, K]
+        dequantize_int4_to_bf16(
+            (uint8_t*)weight.qweight.data, (float*)weight.scales4.data,
+            deq_w, N, K, weight.group_size, 0, weight.nf4_grid);
+
+        // Residual GEMM: out[M,N] += bf16_x_rot[M,K] @ deq_w[N,K]^T  (beta=1, accumulate)
+        CUBLAS_CHECK(cublasGemmEx(cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K, &alpha,
+            deq_w,  CUDA_R_16BF, K,
+            bf16_x, CUDA_R_16BF, K,
+            &beta1,
+            (float*)out.data, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
-
-    // 5. Convert rotated FP32 -> BF16 (reuse region C)
-    fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
-
-    // 6. Dequantize INT4 packed [N, K/2] -> BF16 [N, K]
-    dequantize_int4_to_bf16(
-        (uint8_t*)weight.qweight.data, (float*)weight.scales4.data,
-        deq_w, N, K, weight.group_size);
-
-    // 7. Residual GEMM: out[M,N] += bf16_x_rot[M,K] @ deq_w[N,K]^T  (beta=1, accumulate)
-    CUBLAS_CHECK(cublasGemmEx(cublas(),
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K, &alpha,
-        deq_w,  CUDA_R_16BF, K,
-        bf16_x, CUDA_R_16BF, K,
-        &beta1,
-        (float*)out.data, CUDA_R_32F, N,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // 8. Add bias
     if (bias) {
@@ -2973,15 +3879,16 @@ bool CalibrationReader::load(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
 
-    uint32_t magic, version, num;
+    uint32_t magic, file_version, num;
     if (fread(&magic, 4, 1, f) != 1 || magic != 0x51545047) {
         fprintf(stderr, "CalibrationReader: bad magic\n");
         fclose(f); return false;
     }
-    if (fread(&version, 4, 1, f) != 1 || version != 1) {
-        fprintf(stderr, "CalibrationReader: unsupported version %u\n", version);
+    if (fread(&file_version, 4, 1, f) != 1 || (file_version != 1 && file_version != 2)) {
+        fprintf(stderr, "CalibrationReader: unsupported version %u\n", file_version);
         fclose(f); return false;
     }
+    this->version = (int)file_version;
     if (fread(&num, 4, 1, f) != 1) { fclose(f); return false; }
 
     entries.resize(num);
@@ -3006,7 +3913,8 @@ bool CalibrationReader::load(const char* path) {
         }
     }
     fclose(f);
-    fprintf(stderr, "CalibrationReader: loaded %u entries from %s\n", num, path);
+    fprintf(stderr, "CalibrationReader: loaded %u entries (v%d%s) from %s\n", num, this->version,
+            this->version == 2 ? ", raw" : ", FWHT-rotated", path);
     return true;
 }
 
@@ -3055,42 +3963,118 @@ static const float NF4_GRID_HOST[16] = {
      0.0796f,  0.1609f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f, 1.0f
 };
 
-// GPTQ block kernel: process one group of columns (group_size) with error feedback.
-// One thread per row of R. Sequentially processes group_size columns.
+// GPTQ block kernel for symmetric linear INT4: process one group of columns with error feedback.
+// Same structure as NF4 kernel but uses round-to-nearest instead of grid search.
+// Scale = max/7, q = round(x*7/max)+8, clamp [0,15]
+__global__ void gptq_linear_int4_block_kernel(
+    float* __restrict__ R,
+    const float* __restrict__ H_inv,
+    uint8_t* __restrict__ qweight,
+    float* __restrict__ scales,
+    float* __restrict__ E_out,
+    int N, int K, int block_start, int block_size, int gs)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+
+    int num_groups = K / gs;
+
+    // Process columns sequentially with error feedback
+    // Scale recomputed at each group boundary
+    float scale = 0.0f, inv_scale = 0.0f;
+    for (int j = 0; j < block_size; j++) {
+        int col = block_start + j;
+
+        // At group boundary: compute scale for this group
+        if (j % gs == 0) {
+            int group_idx = col / gs;
+            int group_end = min(gs, block_size - j);
+            float max_abs = 0.0f;
+            for (int g = 0; g < group_end; g++) {
+                float v = fabsf(R[(int64_t)row * K + col + g]);
+                if (v > max_abs) max_abs = v;
+            }
+            scale = max_abs / 7.0f;
+            inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+            scales[(int64_t)row * num_groups + group_idx] = scale;
+        }
+
+        float w = R[(int64_t)row * K + col];
+
+        // Round to nearest integer, clamp to [-7, 7]
+        int q_signed = (int)roundf(w * inv_scale);
+        q_signed = max(-7, min(7, q_signed));
+        int q_unsigned = q_signed + 8;
+
+        // Dequantized value
+        float w_hat = (float)q_signed * scale;
+        float error = w - w_hat;
+
+        // Pack quantized value
+        int byte_idx = col / 2;
+        if (col % 2 == 0) {
+            qweight[(int64_t)row * (K / 2) + byte_idx] =
+                (qweight[(int64_t)row * (K / 2) + byte_idx] & 0xF0) | (uint8_t)q_unsigned;
+        } else {
+            qweight[(int64_t)row * (K / 2) + byte_idx] =
+                (qweight[(int64_t)row * (K / 2) + byte_idx] & 0x0F) | ((uint8_t)q_unsigned << 4);
+        }
+
+        // GPTQ error propagation
+        float h_jj = H_inv[(int64_t)col * K + col];
+        float err_scale = (h_jj > 1e-12f) ? (error / h_jj) : 0.0f;
+        E_out[(int64_t)row * block_size + j] = err_scale;
+
+        for (int k = j + 1; k < block_size; k++) {
+            int col_k = block_start + k;
+            R[(int64_t)row * K + col_k] -= err_scale * H_inv[(int64_t)col * K + col_k];
+        }
+    }
+}
+
+// GPTQ block kernel: process one block of columns with error feedback.
+// One thread per row of R. Sequentially processes block_size columns.
 // R: [N, K] residual matrix (row-major) — modified in place
 // H_inv: [K, K] inverse Hessian (row-major)
-// qweight: [N, K/2] packed NF4 output
+// qweight: [N, K/2] packed output
 // scales: [N, num_groups] per-group scales
 // block_start: first column of this block
-// gs: group_size
-// E_out: [N, gs] error matrix output for cross-block update
+// block_size: number of columns in this block (GPTQ error propagation window)
+// gs: group_size (scale granularity, may differ from block_size)
+// E_out: [N, block_size] error matrix output for cross-block update
 __global__ void gptq_nf4_block_kernel(
     float* __restrict__ R,
     const float* __restrict__ H_inv,
     uint8_t* __restrict__ qweight,
     float* __restrict__ scales,
     float* __restrict__ E_out,
-    int N, int K, int block_start, int gs)
+    int N, int K, int block_start, int block_size, int gs)
 {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= N) return;
 
     int num_groups = K / gs;
-    int group_idx = block_start / gs;
-
-    // Compute per-group scale: max(|R[row, block_start:block_start+gs]|)
-    float max_abs = 0.0f;
-    for (int j = 0; j < gs; j++) {
-        float v = fabsf(R[(int64_t)row * K + block_start + j]);
-        if (v > max_abs) max_abs = v;
-    }
-    float scale = max_abs;
-    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-    scales[(int64_t)row * num_groups + group_idx] = scale;
 
     // Process columns sequentially with error feedback
-    for (int j = 0; j < gs; j++) {
+    // Scale is recomputed at each group boundary within the block
+    float scale = 0.0f, inv_scale = 0.0f;
+    for (int j = 0; j < block_size; j++) {
         int col = block_start + j;
+
+        // At group boundary: compute scale for this group
+        if (j % gs == 0) {
+            int group_idx = col / gs;
+            int group_end = min(gs, block_size - j);
+            float max_abs = 0.0f;
+            for (int g = 0; g < group_end; g++) {
+                float v = fabsf(R[(int64_t)row * K + col + g]);
+                if (v > max_abs) max_abs = v;
+            }
+            scale = max_abs;
+            inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+            scales[(int64_t)row * num_groups + group_idx] = scale;
+        }
+
         float w = R[(int64_t)row * K + col];
         float normalized = w * inv_scale;
 
@@ -3121,24 +4105,26 @@ __global__ void gptq_nf4_block_kernel(
         float err_scale = (h_jj > 1e-12f) ? (error / h_jj) : 0.0f;
 
         // Store scaled error for cross-block GEMM update
-        E_out[(int64_t)row * gs + j] = err_scale;
+        E_out[(int64_t)row * block_size + j] = err_scale;
 
         // Propagate within block: R[:, k] -= E_j * H_inv[j, k]
-        for (int k = j + 1; k < gs; k++) {
+        for (int k = j + 1; k < block_size; k++) {
             int col_k = block_start + k;
             R[(int64_t)row * K + col_k] -= err_scale * H_inv[(int64_t)col * K + col_k];
         }
     }
 }
 
-// Host function: GPTQ quantize the Hadamard-rotated residual R using calibration data.
+// Host function: GPTQ quantize the residual R using calibration data.
 // R: [N, K] FP32 on GPU (modified in place — consumed)
-// x_rot: [M_total, K] FP32 on GPU (Hadamard-rotated calibration activations)
+// x_rot: [M_total, K] FP32 on GPU (calibration activations, rotated or not)
+// nf4_grid: true = NF4 lookup, false = symmetric linear INT4
 // Returns packed qweight [N, K/2] and scales [N, K/gs] via output tensors.
 static void gptq_quantize_nf4(
     float* R_gpu, int N, int K, int group_size,
     const float* x_rot_gpu, int M_total,
-    Tensor& out_qweight, Tensor& out_scales)
+    Tensor& out_qweight, Tensor& out_scales,
+    bool nf4_grid = true)
 {
     int gs = group_size;
     int num_groups = K / gs;
@@ -3234,55 +4220,56 @@ static void gptq_quantize_nf4(
     out_qweight.zero();
     out_scales = Tensor::alloc({(int64_t)N, (int64_t)num_groups}, DType::FP32);
 
+    // GPTQ block size: controls error propagation window (independent of group_size)
+    // Larger blocks = better error redistribution but more compute per kernel launch
+    int gptq_block_size = 128;
+    // Ensure block size is multiple of group size and doesn't exceed K
+    if (gptq_block_size < gs) gptq_block_size = gs;
+    while (gptq_block_size % gs != 0) gptq_block_size += gs;
+    if (gptq_block_size > K) gptq_block_size = K;
+
     // Error buffer for cross-block update
     float* E_gpu;
-    CUDA_CHECK(cudaMalloc(&E_gpu, (int64_t)N * gs * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&E_gpu, (int64_t)N * gptq_block_size * sizeof(float)));
 
     // 5. Process column blocks
-    for (int block_start = 0; block_start < K; block_start += gs) {
-        int current_gs = std::min(gs, K - block_start);
+    for (int block_start = 0; block_start < K; block_start += gptq_block_size) {
+        int current_bs = std::min(gptq_block_size, K - block_start);
 
         // Launch GPTQ block kernel: one thread per row
         int threads = 256;
         int blocks = (N + threads - 1) / threads;
-        gptq_nf4_block_kernel<<<blocks, threads>>>(
-            R_gpu, H_gpu,
-            (uint8_t*)out_qweight.data, (float*)out_scales.data,
-            E_gpu,
-            N, K, block_start, current_gs);
+        if (nf4_grid) {
+            gptq_nf4_block_kernel<<<blocks, threads>>>(
+                R_gpu, H_gpu,
+                (uint8_t*)out_qweight.data, (float*)out_scales.data,
+                E_gpu,
+                N, K, block_start, current_bs, gs);
+        } else {
+            gptq_linear_int4_block_kernel<<<blocks, threads>>>(
+                R_gpu, H_gpu,
+                (uint8_t*)out_qweight.data, (float*)out_scales.data,
+                E_gpu,
+                N, K, block_start, current_bs, gs);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Cross-block update: R[:, remaining] -= E × H_inv[block, remaining]
-        int remaining = K - (block_start + current_gs);
+        int remaining = K - (block_start + current_bs);
         if (remaining > 0) {
-            // E: [N, gs] row-major
-            // H_inv_sub: [gs, remaining] starting at H_inv[block_start, block_start+gs]
-            // R_sub: [N, remaining] starting at R[:, block_start+gs]
             float alpha = -1.0f, beta = 1.0f;
-            // In col-major: E_col [gs, N] lda=gs, H_sub_col [remaining, gs] lda=K
-            // C_col [remaining, N] lda=K
-            // We need: R_sub -= E × H_sub
-            // Col-major: C[remaining,N] = H_sub^T[remaining,gs] × E_col[gs,N]... not quite.
-            // R row-major [N, K]: R_sub at offset (block_start+gs) with stride K
-            // E row-major [N, gs]: col-major [gs, N] lda=gs
-            // H_inv row-major [K, K]: H_sub at row=block_start, col=block_start+gs, shape [gs, remaining]
-            //   col-major: [remaining, gs] lda=K (starting at H_inv + block_start*K + block_start+gs)
-            // Result: R_sub col-major [K-..., N] lda=K at R_gpu + block_start + gs
-            //
-            // R_sub[N, remaining] -= E[N, gs] @ H_sub[gs, remaining]
-            // Col-major: R_sub_col[remaining, N] -= H_sub_col^T[remaining, gs] @ E_col[gs, N]
-            // But H_sub col-major is [remaining, gs] lda=K. Its transpose is [gs, remaining].
-            // cublasSgemm(T, N, remaining, N, gs, -1, H_sub, K, E, gs, 1, R_sub, K)
-            // R_rm[N, remaining] -= E_rm[N, gs] @ Hblock_rm[gs, remaining]
-            // Col-major: R_cm[remaining, N] -= Hblock_cm[remaining, gs] @ E_cm[gs, N]
+            // E: [N, current_bs] row-major → col-major [current_bs, N] lda=current_bs
+            // H_sub: rows [block_start..block_start+current_bs), cols [block_start+current_bs..K)
+            //   shape [current_bs, remaining], row-major → col-major [remaining, current_bs] lda=K
+            // R_sub: [N, remaining] starting at col block_start+current_bs, stride K
             CUBLAS_CHECK(cublasSgemm(cublas(),
                 CUBLAS_OP_N, CUBLAS_OP_N,
-                remaining, N, current_gs,
+                remaining, N, current_bs,
                 &alpha,
-                H_gpu + (int64_t)block_start * K + (block_start + current_gs), K,
-                E_gpu, current_gs,
+                H_gpu + (int64_t)block_start * K + (block_start + current_bs), K,
+                E_gpu, current_bs,
                 &beta,
-                R_gpu + (block_start + current_gs), K));
+                R_gpu + (block_start + current_bs), K));
             CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
@@ -3293,7 +4280,8 @@ static void gptq_quantize_nf4(
 
 // GPTQ-guided INT4+SVD quantization
 QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int rank, int group_size,
-                                                   const float* x_rot_gpu, int M_total, int x_K) {
+                                                   const float* x_rot_gpu, int M_total, int x_K,
+                                                   bool no_hadamard, bool nf4_grid, bool error_svd) {
     assert(bf16_weight.dtype == DType::BF16);
     assert(bf16_weight.ndim == 2);
 
@@ -3317,8 +4305,85 @@ QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int 
     Tensor fp32_w = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
     bf16_to_fp32((__nv_bfloat16*)bf16_weight.data, (float*)fp32_w.data, (int64_t)N * K);
 
-    // === Randomized SVD (same as quantize_weight_tensor_int4) ===
+    // For error SVD: compute preliminary quantization error and SVD that instead of the weight.
+    // This is the SVDQuant approach: SVD captures what INT4 struggles with.
+    Tensor svd_target; // matrix to apply randomized SVD to
+    if (error_svd) {
+        // 1. Apply Hadamard rotation to weight (if using Hadamard)
+        Tensor w_rot = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+        CUDA_CHECK(cudaMemcpy(w_rot.data, fp32_w.data, (int64_t)N * K * sizeof(float), cudaMemcpyDeviceToDevice));
+        int hbs_prelim = no_hadamard ? 1 : hadamard_block_size(K);
+        if (hbs_prelim > 1)
+            fwht_inplace((float*)w_rot.data, N, K, hbs_prelim);
+
+        // 2. Naive NF4 per-group quantization of rotated weight (no GPTQ)
+        Tensor prelim_qw = Tensor::alloc({(int64_t)N, (int64_t)(K / 2)}, DType::UINT8);
+        Tensor prelim_sc = Tensor::alloc({(int64_t)N, (int64_t)(K / gs)}, DType::FP32);
+        quantize_int4_per_group((float*)w_rot.data, (uint8_t*)prelim_qw.data,
+                                 (float*)prelim_sc.data, N, K, gs);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 3. Dequantize back to FP32 (in rotated domain) via BF16 intermediate
+        Tensor deq_bf16 = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::BF16);
+        dequantize_int4_to_bf16((uint8_t*)prelim_qw.data, (float*)prelim_sc.data,
+                                 (__nv_bfloat16*)deq_bf16.data, N, K, gs, 0, true /* NF4 */);
+        prelim_qw.free_data();
+        prelim_sc.free_data();
+
+        // Convert dequantized BF16 → FP32
+        Tensor deq_fp32 = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+        bf16_to_fp32((__nv_bfloat16*)deq_bf16.data, (float*)deq_fp32.data, (int64_t)N * K);
+        deq_bf16.free_data();
+
+        // 4. Error in rotated domain: E_rot = W_rot - W_hat_rot
+        // Then un-rotate: E = FWHT(E_rot) to get error in original domain
+        // E_rot = W_rot - deq_fp32, then FWHT(E_rot) = FWHT(W_rot) - FWHT(deq_fp32)
+        // Since FWHT(W_rot) = W (self-inverse), E = W - FWHT(deq_fp32)
+        // Compute in-place: w_rot = w_rot - deq_fp32 (= E_rot), then FWHT(w_rot) (= E)
+        {
+            float neg = -1.0f, one_f = 1.0f;
+            // w_rot -= deq_fp32
+            CUBLAS_CHECK(cublasSaxpy(cublas(), N * K, &neg, (float*)deq_fp32.data, 1, (float*)w_rot.data, 1));
+        }
+        deq_fp32.free_data();
+
+        // Un-rotate error back to original domain
+        if (hbs_prelim > 1)
+            fwht_inplace((float*)w_rot.data, N, K, hbs_prelim);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        svd_target = std::move(w_rot); // SVD will operate on the quantization error
+        fprintf(stderr, "    [error SVD: SVD of quantization error instead of weight]\n");
+    }
+
+    // Matrix to SVD: either the weight (standard) or the quantization error (error_svd)
+    float* svd_matrix = error_svd ? (float*)svd_target.data : (float*)fp32_w.data;
+
+    // === Randomized SVD with power iterations ===
     float alpha_f = 1.0f, beta_f = 0.0f, neg_one = -1.0f, one = 1.0f;
+    const int n_power_iter = 0;  // Power iterations don't improve quality (tested: 16.06 dB with or without)
+
+    // Modified Gram-Schmidt QR helper (orthogonalizes columns in-place)
+    // Matrix is [rows × cols] row-major (cols × rows col-major), stride = cols
+    auto gram_schmidt_qr = [&](float* Q_data, int rows, int cols) {
+        Tensor dots_buf = Tensor::alloc({(int64_t)cols}, DType::FP32);
+        float zero_f = 0.0f, neg_one_f = -1.0f, one_f = 1.0f;
+        for (int j = 0; j < cols; j++) {
+            float norm_sq;
+            CUBLAS_CHECK(cublasSdot(cublas(), rows, Q_data + j, cols, Q_data + j, cols, &norm_sq));
+            float inv_norm = (norm_sq > 1e-24f) ? (1.0f / sqrtf(norm_sq)) : 0.0f;
+            CUBLAS_CHECK(cublasSscal(cublas(), rows, &inv_norm, Q_data + j, cols));
+            if (j + 1 < cols) {
+                int rem = cols - j - 1;
+                CUBLAS_CHECK(cublasSgemv(cublas(), CUBLAS_OP_N,
+                    rem, rows, &one_f, Q_data + (j + 1), cols, Q_data + j, cols,
+                    &zero_f, (float*)dots_buf.data, 1));
+                CUBLAS_CHECK(cublasSger(cublas(), rem, rows, &neg_one_f,
+                    (float*)dots_buf.data, 1, Q_data + j, cols, Q_data + (j + 1), cols));
+            }
+        }
+        dots_buf.free_data();
+    };
 
     // 1. Random Omega
     std::vector<float> omega_host((int64_t)K * rp);
@@ -3327,41 +4392,46 @@ QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int 
     Tensor omega = Tensor::alloc({(int64_t)K, (int64_t)rp}, DType::FP32);
     omega.from_host(omega_host.data());
 
-    // 2. Y = W @ Omega
+    // 2. Y = M @ Omega  (M = weight or quantization error)
     Tensor Y = Tensor::alloc({(int64_t)N, (int64_t)rp}, DType::FP32);
     CUBLAS_CHECK(cublasGemmEx(cublas(),
         CUBLAS_OP_N, CUBLAS_OP_N, rp, N, K, &alpha_f,
-        omega.data, CUDA_R_32F, rp, fp32_w.data, CUDA_R_32F, K, &beta_f,
+        omega.data, CUDA_R_32F, rp, svd_matrix, CUDA_R_32F, K, &beta_f,
         Y.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     omega.free_data();
 
-    // 3. Modified Gram-Schmidt QR
-    {
-        float* Q_data = (float*)Y.data;
-        Tensor dots_buf = Tensor::alloc({(int64_t)rp}, DType::FP32);
-        float zero_f = 0.0f, neg_one_f = -1.0f, one_f = 1.0f;
-        for (int j = 0; j < rp; j++) {
-            float norm_sq;
-            CUBLAS_CHECK(cublasSdot(cublas(), N, Q_data + j, rp, Q_data + j, rp, &norm_sq));
-            float inv_norm = (norm_sq > 1e-24f) ? (1.0f / sqrtf(norm_sq)) : 0.0f;
-            CUBLAS_CHECK(cublasSscal(cublas(), N, &inv_norm, Q_data + j, rp));
-            if (j + 1 < rp) {
-                int rem = rp - j - 1;
-                CUBLAS_CHECK(cublasSgemv(cublas(), CUBLAS_OP_N,
-                    rem, N, &one_f, Q_data + (j + 1), rp, Q_data + j, rp,
-                    &zero_f, (float*)dots_buf.data, 1));
-                CUBLAS_CHECK(cublasSger(cublas(), rem, N, &neg_one_f,
-                    (float*)dots_buf.data, 1, Q_data + j, rp, Q_data + (j + 1), rp));
-            }
-        }
-        dots_buf.free_data();
+    // Power iterations: Y ← M @ (M^T @ QR(Y)), repeated n_power_iter times
+    // This computes the range of (M M^T)^q M, amplifying singular value gaps
+    for (int pi = 0; pi < n_power_iter; pi++) {
+        // QR(Y) in-place
+        gram_schmidt_qr((float*)Y.data, N, rp);
+
+        // Z = M^T @ Y  [K × rp]
+        Tensor Z = Tensor::alloc({(int64_t)K, (int64_t)rp}, DType::FP32);
+        CUBLAS_CHECK(cublasGemmEx(cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_T, rp, K, N, &alpha_f,
+            Y.data, CUDA_R_32F, rp, svd_matrix, CUDA_R_32F, K, &beta_f,
+            Z.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+        // QR(Z) in-place
+        gram_schmidt_qr((float*)Z.data, K, rp);
+
+        // Y = M @ Z  [N × rp]
+        CUBLAS_CHECK(cublasGemmEx(cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_N, rp, N, K, &alpha_f,
+            Z.data, CUDA_R_32F, rp, svd_matrix, CUDA_R_32F, K, &beta_f,
+            Y.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        Z.free_data();
     }
 
-    // 4. B = Q^T @ W
+    // 3. Final QR(Y)
+    gram_schmidt_qr((float*)Y.data, N, rp);
+
+    // 4. B = Q^T @ M
     Tensor B = Tensor::alloc({(int64_t)rp, (int64_t)K}, DType::FP32);
     CUBLAS_CHECK(cublasGemmEx(cublas(),
         CUBLAS_OP_N, CUBLAS_OP_T, K, rp, N, &alpha_f,
-        fp32_w.data, CUDA_R_32F, K, Y.data, CUDA_R_32F, rp, &beta_f,
+        svd_matrix, CUDA_R_32F, K, Y.data, CUDA_R_32F, rp, &beta_f,
         B.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
     // 5. C = B @ B^T
@@ -3418,28 +4488,34 @@ QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int 
     U_sigma_gpu.free_data();
     Y.free_data();
 
-    // 8. Residual R = W - L_up @ L_down^T
+    // 8. Residual R = W - L_up @ L_down^T (always from original weight, not error)
     CUBLAS_CHECK(cublasGemmEx(cublas(),
         CUBLAS_OP_T, CUBLAS_OP_N, K, N, r, &neg_one,
         L_down_gpu.data, CUDA_R_32F, r, L_up_gpu.data, CUDA_R_32F, r, &one,
         fp32_w.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 9. Hadamard rotation of residual
-    int hbs = hadamard_block_size(K);
+    // Free error SVD target if it was allocated
+    if (error_svd) svd_target.free_data();
+
+    // 9. Hadamard rotation of residual (skipped if no_hadamard)
+    int hbs = no_hadamard ? 1 : hadamard_block_size(K);
     if (hbs > 1) {
         fwht_inplace((float*)fp32_w.data, N, K, hbs);
     }
 
-    // 10. GPTQ quantization of Hadamard-rotated residual
-    // x_rot_gpu [M_total, K] already has the correct K (Hadamard-rotated calibration)
+    // 10. GPTQ quantization of residual
+    // x_rot_gpu [M_total, K] already has the correct K (calibration activations)
     assert(x_K == K);
 
     Tensor qw_data, qw_scales;
     gptq_quantize_nf4((float*)fp32_w.data, N, K, gs,
                        x_rot_gpu, M_total,
-                       qw_data, qw_scales);
+                       qw_data, qw_scales, nf4_grid);
     fp32_w.free_data();
+
+    // SVD refinement was tested but hurts quality (-0.85 dB).
+    // The GPTQ-optimized residual becomes stale when SVD factors change.
 
     // 11. Convert L_up, L_down to BF16
     Tensor svd_up_bf16 = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::BF16);
@@ -3460,5 +4536,255 @@ QuantizedWeight quantize_weight_tensor_int4_gptq(const Tensor& bf16_weight, int 
     qw.group_size = gs;
     qw.svd_rank = r;
     qw.had_block_size = hbs;
+    qw.nf4_grid = nf4_grid;
+    return qw;
+}
+
+// ================================================================
+// GPTQ+Smooth INT4+SVD quantization
+// Takes RAW activations, computes smooth factors, applies to weight,
+// then runs SVD + GPTQ on the smoothed weight.
+// ================================================================
+
+QuantizedWeight quantize_weight_tensor_int4_gptq_smooth(const Tensor& bf16_weight, int rank, int group_size,
+                                                          const float* x_raw_gpu, int M_total, int x_K) {
+    assert(bf16_weight.dtype == DType::BF16);
+    assert(bf16_weight.ndim == 2);
+
+    int N = (int)bf16_weight.shape[0];
+    int K = (int)bf16_weight.shape[1];
+    assert(x_K == K);
+
+    // Adjust group_size for small K
+    int gs = std::min(group_size, K);
+    while (K % gs != 0 && gs > 2) gs /= 2;
+    assert(K % gs == 0);
+    assert(K % 2 == 0);
+
+    // Clamp rank
+    int r = std::min(rank, std::min(N, K) - 1);
+    int p = 10;
+    int rp = r + p;
+    if (rp > std::min(N, K)) rp = std::min(N, K);
+    if (r > rp) r = rp;
+
+    // Convert BF16 weight -> FP32 on GPU
+    Tensor fp32_w = Tensor::alloc({(int64_t)N, (int64_t)K}, DType::FP32);
+    bf16_to_fp32((__nv_bfloat16*)bf16_weight.data, (float*)fp32_w.data, (int64_t)N * K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Download weight and activations to CPU for smooth factor computation
+    std::vector<float> w_host((int64_t)N * K);
+    CUDA_CHECK(cudaMemcpy(w_host.data(), fp32_w.data, (int64_t)N * K * sizeof(float), cudaMemcpyDeviceToHost));
+
+    std::vector<float> x_host((int64_t)M_total * K);
+    CUDA_CHECK(cudaMemcpy(x_host.data(), x_raw_gpu, (int64_t)M_total * K * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Compute smooth factors using activation-aware channel balancing.
+    // Raw formula: s_raw[j] = (max|X_j|)^alpha / (max|W_j|)^(1-alpha)
+    // Then normalize by geometric mean so factors are centered around 1.
+    // This redistributes outlier energy between channels without changing overall scale.
+    const float alpha = 0.5f;
+    std::vector<float> smooth_host(K);
+    {
+        std::vector<float> s_raw(K);
+        double log_sum = 0.0;
+        for (int j = 0; j < K; j++) {
+            float amax = 0.0f;
+            for (int m = 0; m < M_total; m++) {
+                float v = fabsf(x_host[(int64_t)m * K + j]);
+                if (v > amax) amax = v;
+            }
+            float wmax = 0.0f;
+            for (int n = 0; n < N; n++) {
+                float v = fabsf(w_host[(int64_t)n * K + j]);
+                if (v > wmax) wmax = v;
+            }
+            float s = powf(amax + 1e-12f, alpha) / powf(wmax + 1e-12f, 1.0f - alpha);
+            s = fminf(fmaxf(s, 1e-5f), 1e5f);
+            s_raw[j] = s;
+            log_sum += logf(s);
+        }
+        // Normalize by geometric mean to center around 1
+        float geo_mean = expf((float)(log_sum / K));
+        float inv_geo = 1.0f / geo_mean;
+        for (int j = 0; j < K; j++) {
+            float s = s_raw[j] * inv_geo;
+            // Clamp to prevent extreme factors
+            s = fminf(fmaxf(s, 0.1f), 10.0f);
+            smooth_host[j] = s;
+        }
+    }
+
+    // Apply smooth to weight on CPU: W[n,j] *= s[j]
+    for (int n = 0; n < N; n++) {
+        for (int j = 0; j < K; j++) {
+            w_host[(int64_t)n * K + j] *= smooth_host[j];
+        }
+    }
+
+    // Re-upload smoothed weight to GPU
+    CUDA_CHECK(cudaMemcpy(fp32_w.data, w_host.data(), (int64_t)N * K * sizeof(float), cudaMemcpyHostToDevice));
+    w_host.clear();
+    x_host.clear();
+
+    // Upload smooth factors to GPU
+    Tensor smooth_gpu = Tensor::alloc({(int64_t)K}, DType::FP32);
+    smooth_gpu.from_host(smooth_host.data());
+
+    // Apply smooth to activations on GPU: X_smooth = X / s
+    float* x_smooth_gpu;
+    CUDA_CHECK(cudaMalloc(&x_smooth_gpu, (int64_t)M_total * K * sizeof(float)));
+    apply_smooth_div(x_raw_gpu, (const float*)smooth_gpu.data, x_smooth_gpu, M_total, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // === Randomized SVD on smoothed weight ===
+    float alpha_f = 1.0f, beta_f = 0.0f, neg_one = -1.0f, one = 1.0f;
+
+    // 1. Random Omega
+    std::vector<float> omega_host((int64_t)K * rp);
+    srand(42);
+    for (auto& v : omega_host) v = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    Tensor omega = Tensor::alloc({(int64_t)K, (int64_t)rp}, DType::FP32);
+    omega.from_host(omega_host.data());
+
+    // 2. Y = W_smooth @ Omega
+    Tensor Y = Tensor::alloc({(int64_t)N, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, rp, N, K, &alpha_f,
+        omega.data, CUDA_R_32F, rp, fp32_w.data, CUDA_R_32F, K, &beta_f,
+        Y.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    omega.free_data();
+
+    // 3. Modified Gram-Schmidt QR
+    {
+        float* Q_data = (float*)Y.data;
+        Tensor dots_buf = Tensor::alloc({(int64_t)rp}, DType::FP32);
+        float zero_f = 0.0f, neg_one_f = -1.0f, one_f = 1.0f;
+        for (int j = 0; j < rp; j++) {
+            float norm_sq;
+            CUBLAS_CHECK(cublasSdot(cublas(), N, Q_data + j, rp, Q_data + j, rp, &norm_sq));
+            float inv_norm = (norm_sq > 1e-24f) ? (1.0f / sqrtf(norm_sq)) : 0.0f;
+            CUBLAS_CHECK(cublasSscal(cublas(), N, &inv_norm, Q_data + j, rp));
+            if (j + 1 < rp) {
+                int rem = rp - j - 1;
+                CUBLAS_CHECK(cublasSgemv(cublas(), CUBLAS_OP_N,
+                    rem, N, &one_f, Q_data + (j + 1), rp, Q_data + j, rp,
+                    &zero_f, (float*)dots_buf.data, 1));
+                CUBLAS_CHECK(cublasSger(cublas(), rem, N, &neg_one_f,
+                    (float*)dots_buf.data, 1, Q_data + j, rp, Q_data + (j + 1), rp));
+            }
+        }
+        dots_buf.free_data();
+    }
+
+    // 4. B = Q^T @ W_smooth
+    Tensor B = Tensor::alloc({(int64_t)rp, (int64_t)K}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, K, rp, N, &alpha_f,
+        fp32_w.data, CUDA_R_32F, K, Y.data, CUDA_R_32F, rp, &beta_f,
+        B.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+
+    // 5. C = B @ B^T
+    Tensor C_gpu = Tensor::alloc({(int64_t)rp, (int64_t)rp}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, rp, rp, K, &alpha_f,
+        B.data, CUDA_R_32F, K, B.data, CUDA_R_32F, K, &beta_f,
+        C_gpu.data, CUDA_R_32F, rp, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> C_host(rp * rp);
+    C_gpu.to_host(C_host.data());
+    C_gpu.free_data();
+
+    std::vector<float> D(rp);
+    cpu_jacobi_eig(C_host.data(), D.data(), rp);
+
+    std::vector<float> sigma(r);
+    for (int i = 0; i < r; i++)
+        sigma[i] = (D[i] > 0) ? sqrtf(D[i]) : 0.0f;
+
+    std::vector<float> U_inv_sigma(rp * r);
+    std::vector<float> U_sigma(rp * r);
+    for (int j = 0; j < r; j++) {
+        float s = sigma[j];
+        float inv_s = (s > 1e-12f) ? (1.0f / s) : 0.0f;
+        for (int m = 0; m < rp; m++) {
+            U_inv_sigma[m * r + j] = C_host[m * rp + j] * inv_s;
+            U_sigma[m * r + j] = C_host[m * rp + j] * s;
+        }
+    }
+
+    Tensor U_inv_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    Tensor U_sigma_gpu = Tensor::alloc({(int64_t)rp, (int64_t)r}, DType::FP32);
+    U_inv_sigma_gpu.from_host(U_inv_sigma.data());
+    U_sigma_gpu.from_host(U_sigma.data());
+
+    // 6. L_down [K, r]
+    Tensor L_down_gpu = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_T, r, K, rp, &alpha_f,
+        U_inv_sigma_gpu.data, CUDA_R_32F, r, B.data, CUDA_R_32F, K, &beta_f,
+        L_down_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_inv_sigma_gpu.free_data();
+    B.free_data();
+
+    // 7. L_up [N, r]
+    Tensor L_up_gpu = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::FP32);
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_N, CUBLAS_OP_N, r, N, rp, &alpha_f,
+        U_sigma_gpu.data, CUDA_R_32F, r, Y.data, CUDA_R_32F, rp, &beta_f,
+        L_up_gpu.data, CUDA_R_32F, r, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    U_sigma_gpu.free_data();
+    Y.free_data();
+
+    // 8. Residual R = W_smooth - L_up @ L_down^T
+    CUBLAS_CHECK(cublasGemmEx(cublas(),
+        CUBLAS_OP_T, CUBLAS_OP_N, K, N, r, &neg_one,
+        L_down_gpu.data, CUDA_R_32F, r, L_up_gpu.data, CUDA_R_32F, r, &one,
+        fp32_w.data, CUDA_R_32F, K, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 9. Hadamard rotation of residual (TODO: add no_hadamard support)
+    int hbs = hadamard_block_size(K);
+    if (hbs > 1) {
+        fwht_inplace((float*)fp32_w.data, N, K, hbs);
+    }
+
+    // 10. Hadamard-rotate smoothed activations for GPTQ Hessian
+    if (hbs > 1) {
+        fwht_inplace(x_smooth_gpu, M_total, K, hbs);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 11. GPTQ quantization of Hadamard-rotated residual
+    Tensor qw_data, qw_scales;
+    gptq_quantize_nf4((float*)fp32_w.data, N, K, gs,
+                       x_smooth_gpu, M_total,
+                       qw_data, qw_scales, true /* nf4 for smooth path */);
+    fp32_w.free_data();
+    CUDA_CHECK(cudaFree(x_smooth_gpu));
+
+    // 12. Convert L_up, L_down to BF16
+    Tensor svd_up_bf16 = Tensor::alloc({(int64_t)N, (int64_t)r}, DType::BF16);
+    Tensor svd_down_bf16 = Tensor::alloc({(int64_t)K, (int64_t)r}, DType::BF16);
+    fp32_to_bf16((float*)L_up_gpu.data, (__nv_bfloat16*)svd_up_bf16.data, (int64_t)N * r);
+    fp32_to_bf16((float*)L_down_gpu.data, (__nv_bfloat16*)svd_down_bf16.data, (int64_t)K * r);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    L_up_gpu.free_data();
+    L_down_gpu.free_data();
+
+    // 13. Package
+    QuantizedWeight qw;
+    qw.mode = QuantMode::INT4_SVD;
+    qw.qweight = std::move(qw_data);
+    qw.scales4 = std::move(qw_scales);
+    qw.svd_up = std::move(svd_up_bf16);
+    qw.svd_down = std::move(svd_down_bf16);
+    qw.smooth = std::move(smooth_gpu);
+    qw.group_size = gs;
+    qw.svd_rank = r;
+    qw.had_block_size = hbs;
+    qw.nf4_grid = true;
     return qw;
 }

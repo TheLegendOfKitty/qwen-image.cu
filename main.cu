@@ -28,7 +28,8 @@ struct Config {
     int steps = 20;
     float cfg_scale = 7.0f;
     unsigned long long seed = 42;
-    float flow_shift = 3.0f; // Qwen Image default (matches stable-diffusion.cpp reference)
+    float flow_shift = 0.0f; // 0 = dynamic shifting (diffusers default); >0 = fixed shift (3.0 for sd.cpp)
+    bool legacy_cfg = false; // true = plain CFG (sd.cpp); false = norm-preserving CFG (diffusers)
 };
 
 static Config parse_args(int argc, char** argv) {
@@ -55,6 +56,10 @@ static Config parse_args(int argc, char** argv) {
             cfg.cfg_scale = atof(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             cfg.seed = strtoull(argv[++i], nullptr, 10);
+        } else if (arg == "--w4a4") {
+            g_w4a4_mode = true;
+        } else if (arg == "--legacy-cfg") {
+            cfg.legacy_cfg = true;
         } else if (arg == "--flow-shift" && i + 1 < argc) {
             cfg.flow_shift = atof(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
@@ -69,7 +74,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  --steps N               Sampling steps (default: 20)\n");
             fprintf(stderr, "  --cfg-scale F           CFG scale (default: 7.0)\n");
             fprintf(stderr, "  --seed N                Random seed (default: 42)\n");
-            fprintf(stderr, "  --flow-shift F          Flow shift (default: dynamic)\n");
+            fprintf(stderr, "  --flow-shift F          Fixed flow shift (0=dynamic, 3.0=sd.cpp)\n");
             exit(0);
         }
     }
@@ -117,15 +122,66 @@ __global__ void denoiser_scaling_fp32_kernel(const float* velocity, const float*
     denoised[idx] = x[idx] - sigma * velocity[idx];
 }
 
-// FP32 CFG combine: out_bf16 = uncond_bf16 + cfg_scale * (cond_bf16 - uncond_bf16)
-// Result stored as FP32 (will be used in FP32 denoiser scaling)
-__global__ void cfg_combine_fp32_kernel(const __nv_bfloat16* cond, const __nv_bfloat16* uncond,
-                                         float* out, float cfg_scale, int64_t n) {
+// Legacy CFG: out = uncond + cfg_scale * (cond - uncond)
+__global__ void cfg_combine_legacy_kernel(const __nv_bfloat16* cond, const __nv_bfloat16* uncond,
+                                          float* out, float cfg_scale, int64_t n) {
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float c = __bfloat162float(cond[idx]);
     float u = __bfloat162float(uncond[idx]);
     out[idx] = u + cfg_scale * (c - u);
+}
+
+// Norm-preserving CFG combine (matches diffusers Qwen Image pipeline):
+//   comb = uncond + cfg_scale * (cond - uncond)
+//   cond_norm = ||cond||_dim=-1 per (b,c,h)
+//   comb_norm = ||comb||_dim=-1 per (b,c,h)
+//   out = comb * (cond_norm / comb_norm)
+// Phase 1: compute combined CFG into out, accumulate cond/comb squared norms
+// Norm-preserving CFG: norms computed in PACKED format grouping
+// NCHW element at flat idx → packed group = (h/2)*(W/2) + (w/2)
+// where c = idx/(H*W), h = (idx/W)%H, w = idx%W
+// Each group has C*4 = 64 elements (matches diffusers dim=-1 on packed output)
+__global__ void cfg_combine_and_norms_kernel(
+    const __nv_bfloat16* cond, const __nv_bfloat16* uncond,
+    float* out, float* cond_norm_sq, float* comb_norm_sq,
+    float cfg_scale, int64_t n, int C, int H, int W)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float c = __bfloat162float(cond[idx]);
+    float u = __bfloat162float(uncond[idx]);
+    float comb = u + cfg_scale * (c - u);
+    out[idx] = comb;
+
+    // Map NCHW flat index to packed sequence group
+    int hw = H * W;
+    int ch = (int)(idx / hw);    // channel (unused for group calc, just skip)
+    int rem = (int)(idx % hw);
+    int h = rem / W;
+    int w = rem % W;
+    int group = (h / 2) * (W / 2) + (w / 2);
+    atomicAdd(&cond_norm_sq[group], c * c);
+    atomicAdd(&comb_norm_sq[group], comb * comb);
+}
+
+// Phase 2: scale each element by cond_norm / comb_norm for its group
+__global__ void cfg_norm_scale_kernel(
+    float* out, const float* cond_norm_sq, const float* comb_norm_sq,
+    int64_t n, int C, int H, int W)
+{
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int hw = H * W;
+    int rem = (int)(idx % hw);
+    int h = rem / W;
+    int w = rem % W;
+    int group = (h / 2) * (W / 2) + (w / 2);
+    float cn = sqrtf(cond_norm_sq[group]);
+    float nn = sqrtf(comb_norm_sq[group]);
+    if (nn > 0.0f) {
+        out[idx] *= cn / nn;
+    }
 }
 
 // FP32 denormalize latent: x[c] = x[c] * std[c] + mean[c]
@@ -262,6 +318,33 @@ int main(int argc, char** argv) {
         uncond_context = load_f32_as_bf16("sdcpp_uncond_context.bin", 5 * hidden_size);
     }
 
+    // Load diffusers text encoder embeddings for matching comparison
+    if (getenv("LOAD_DIFFUSERS_EMBED")) {
+        fprintf(stderr, "  LOADING DIFFUSERS EMBEDDINGS!\n");
+        auto load_embed = [&](const char* path) -> Tensor {
+            FILE* f = fopen(path, "rb");
+            if (!f) { fprintf(stderr, "ERROR: cannot open %s\n", path); exit(1); }
+            int32_t hdr[2];
+            fread(hdr, sizeof(int32_t), 2, f);
+            int seq = hdr[0], dim = hdr[1];
+            int64_t n = (int64_t)seq * dim;
+            std::vector<float> fp(n);
+            fread(fp.data(), sizeof(float), n, f);
+            fclose(f);
+            // Convert FP32 → BF16 and upload
+            std::vector<__nv_bfloat16> bf(n);
+            for (int64_t i = 0; i < n; i++) bf[i] = __float2bfloat16(fp[i]);
+            Tensor t = Tensor::alloc({1, (int64_t)seq, (int64_t)dim}, DType::BF16);
+            CUDA_CHECK(cudaMemcpy(t.data, bf.data(), n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+            fprintf(stderr, "    Loaded %s: [1, %d, %d]\n", path, seq, dim);
+            return t;
+        };
+        cond_context.free_data();
+        uncond_context.free_data();
+        cond_context = load_embed("cond_embed.bin");
+        uncond_context = load_embed("uncond_embed.bin");
+    }
+
     // Optionally dump text encoder outputs for verification
     if (getenv("DUMP_CONTEXT")) {
         auto dump_bf16 = [](const char* path, void* data, int64_t n) {
@@ -293,7 +376,7 @@ int main(int argc, char** argv) {
     tf_loader.print_summary();
 
     TransformerWeights tf_weights;
-    tf_weights.load(tf_loader);
+    tf_weights.load(tf_loader, cfg.model_dir);
 
     // ========== Step 5: Compute RoPE PE ==========
     fprintf(stderr, "\n[5/8] Computing RoPE positional embeddings...\n");
@@ -337,10 +420,12 @@ int main(int argc, char** argv) {
 
     // Setup scheduler
     FlowMatchScheduler scheduler;
-    if (cfg.flow_shift > 0) {
+    if (cfg.flow_shift > 0.0f) {
+        // Fixed shift mode (e.g., --flow-shift 3.0 for sd.cpp compatibility)
         scheduler.use_dynamic_shifting = false;
         scheduler.shift = cfg.flow_shift;
     }
+    // else: default dynamic shifting (matches diffusers Qwen Image pipeline)
     auto sigmas = scheduler.get_sigmas(cfg.steps, n_img);
 
     // Scale initial noise by sigma_max (FP32)
@@ -390,8 +475,19 @@ int main(int argc, char** argv) {
         // Convert FP32 latent to BF16 for transformer
         fp32_to_bf16((float*)latent.data, (__nv_bfloat16*)latent_bf16.data, latent_numel);
 
+        // Activate transformer dump for step 0 cond pass
+        if (step == 0 && getenv("DUMP_TRANSFORMER")) {
+            setenv("DUMP_TRANSFORMER_ACTIVE", "1", 1);
+            setenv("DUMP_TRANSFORMER_ACTIVE_STEP", "0", 1);
+        }
+
         // Run transformer for conditional
         denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w, cal_ptr);
+
+        // Deactivate transformer dump after cond pass
+        if (step == 0 && getenv("DUMP_TRANSFORMER")) {
+            unsetenv("DUMP_TRANSFORMER_ACTIVE");
+        }
 
         // Run transformer for unconditional
         denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w, cal_ptr);
@@ -427,11 +523,40 @@ int main(int argc, char** argv) {
         {
             int block = 256;
             int grid = (int)((n + block - 1) / block);
-            cfg_combine_fp32_kernel<<<grid, block>>>(
-                (__nv_bfloat16*)denoised_cond.data,
-                (__nv_bfloat16*)denoised_uncond.data,
-                (float*)velocity_fp32.data,
-                cfg.cfg_scale, n);
+
+            if (cfg.legacy_cfg) {
+                // Plain CFG (matches sd.cpp)
+                cfg_combine_legacy_kernel<<<grid, block>>>(
+                    (__nv_bfloat16*)denoised_cond.data,
+                    (__nv_bfloat16*)denoised_uncond.data,
+                    (float*)velocity_fp32.data,
+                    cfg.cfg_scale, n);
+            } else {
+                // Norm-preserving CFG (matches diffusers Qwen Image pipeline)
+                // Norms in packed format: groups = (H/2)*(W/2) patches, each has C*4 elements
+                int64_t n_groups = (int64_t)(latent_h / 2) * (latent_w / 2);
+                float* d_cond_norm_sq;
+                float* d_comb_norm_sq;
+                CUDA_CHECK(cudaMalloc(&d_cond_norm_sq, n_groups * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&d_comb_norm_sq, n_groups * sizeof(float)));
+                CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, n_groups * sizeof(float)));
+                CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, n_groups * sizeof(float)));
+
+                cfg_combine_and_norms_kernel<<<grid, block>>>(
+                    (__nv_bfloat16*)denoised_cond.data,
+                    (__nv_bfloat16*)denoised_uncond.data,
+                    (float*)velocity_fp32.data,
+                    d_cond_norm_sq, d_comb_norm_sq,
+                    cfg.cfg_scale, n, latent_channels, latent_h, latent_w);
+
+                cfg_norm_scale_kernel<<<grid, block>>>(
+                    (float*)velocity_fp32.data,
+                    d_cond_norm_sq, d_comb_norm_sq,
+                    n, latent_channels, latent_h, latent_w);
+
+                CUDA_CHECK(cudaFree(d_cond_norm_sq));
+                CUDA_CHECK(cudaFree(d_comb_norm_sq));
+            }
         }
         denoised_uncond.free_data();
 
