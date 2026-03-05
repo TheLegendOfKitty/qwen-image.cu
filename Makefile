@@ -1,5 +1,5 @@
 NVCC = nvcc
-CUDA_ARCH = -gencode arch=compute_110,code=sm_110
+CUDA_ARCH = -gencode arch=compute_86,code=sm_86
 LIBS = -lcublas
 INCLUDES = -I.
 FLAGS = -O2 -std=c++17 --expt-relaxed-constexpr --extended-lambda -diag-suppress=177 --use_fast_math

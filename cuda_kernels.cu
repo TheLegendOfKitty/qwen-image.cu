@@ -1794,6 +1794,70 @@ void modulate_fp32_f32params(const float* x, const float* shift, const float* sc
     modulate_fp32_f32params_kernel<<<grid, block, 0, stream>>>(x, shift, scale, out, rows, dim);
 }
 
+// ==================== Fused LayerNorm + Modulate (FP32) ====================
+
+__global__ void layer_norm_modulate_fp32_kernel(const float* x, const float* shift,
+                                                 const float* scale, float* out,
+                                                 int dim, float eps) {
+    int row = blockIdx.x;
+    const float* x_row = x + (int64_t)row * dim;
+    float* o_row = out + (int64_t)row * dim;
+
+    // Pass 1: compute mean
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        sum += x_row[i];
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int warp = threadIdx.x / warpSize;
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = (lane < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) shared[0] = sum;
+    __syncthreads();
+    float mean = shared[0] / dim;
+
+    // Pass 2: compute variance
+    float var_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i] - mean;
+        var_sum += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
+    if (lane == 0) shared[warp] = var_sum;
+    __syncthreads();
+    if (warp == 0) {
+        var_sum = (lane < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) shared[0] = var_sum;
+    __syncthreads();
+    float inv_std = rsqrtf(shared[0] / dim + eps);
+
+    // Pass 3: normalize + modulate fused
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        o_row[i] = (x_row[i] - mean) * inv_std * (1.0f + scale[i]) + shift[i];
+}
+
+void layer_norm_modulate_fp32(const float* x, const float* shift, const float* scale,
+                               float* out, int rows, int dim, float eps, cudaStream_t stream) {
+    int threads = min(1024, ((dim + 31) / 32) * 32);
+    layer_norm_modulate_fp32_kernel<<<rows, threads, 0, stream>>>(x, shift, scale, out, dim, eps);
+}
+
 // ==================== FP32 GELU ====================
 
 __global__ void gelu_fp32_kernel(const float* x, float* out, int64_t n) {
@@ -2516,6 +2580,10 @@ void fwht_quantize_fp32(const float* input, int8_t* output, float* scales,
                          int M, int K, int had_block_size, cudaStream_t stream) {
     int threads = min(1024, ((K + 31) / 32) * 32);
     size_t smem_bytes = ((size_t)K + 32) * sizeof(float);
+    if (smem_bytes > 48u * 1024u) {
+        cudaFuncSetAttribute(fwht_quantize_kernel<float>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    }
     fwht_quantize_kernel<float><<<M, threads, smem_bytes, stream>>>(
         input, output, scales, M, K, had_block_size);
 }
@@ -2524,6 +2592,10 @@ void fwht_quantize_bf16(const __nv_bfloat16* input, int8_t* output, float* scale
                           int M, int K, int had_block_size, cudaStream_t stream) {
     int threads = min(1024, ((K + 31) / 32) * 32);
     size_t smem_bytes = ((size_t)K + 32) * sizeof(float);
+    if (smem_bytes > 48u * 1024u) {
+        cudaFuncSetAttribute(fwht_quantize_kernel<__nv_bfloat16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    }
     fwht_quantize_kernel<__nv_bfloat16><<<M, threads, smem_bytes, stream>>>(
         input, output, scales, M, K, had_block_size);
 }
@@ -2552,12 +2624,38 @@ void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const
         gemm_out, act_scales, w_scales, bias, out, M, N);
 }
 
+// Fused: dequantize INT32 GEMM output + bias + GELU activation
+__global__ void dequantize_bias_gelu_kernel(
+    const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+    const __nv_bfloat16* bias, float* out, int M, int N) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)M * N) return;
+    int row = (int)(idx / N);
+    int col = (int)(idx % N);
+    float val = (float)gemm_out[idx] * act_scales[row] * w_scales[col];
+    if (bias) val += __bfloat162float(bias[col]);
+    const float c = 0.7978845608f;
+    float inner = c * (val + 0.044715f * val * val * val);
+    out[idx] = 0.5f * val * (1.0f + tanhf(inner));
+}
+
+void dequantize_bias_gelu(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+                           const __nv_bfloat16* bias, float* out,
+                           int M, int N, cudaStream_t stream) {
+    int64_t total = (int64_t)M * N;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    dequantize_bias_gelu_kernel<<<grid, block, 0, stream>>>(
+        gemm_out, act_scales, w_scales, bias, out, M, N);
+}
+
 // ==================== INT8 Linear Forward (with Hadamard Rotation) ====================
 
 // FP32 input × INT8 weight → FP32 output
 // Applies Hadamard rotation to activation before quantization.
 void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
-                          const Tensor* bias, Tensor& out, Tensor& scratch) {
+                          const Tensor* bias, Tensor& out, Tensor& scratch,
+                          bool apply_gelu) {
     int M = (int)x.shape[0];
     int K = (int)x.shape[1];
     int N = (int)weight.data.shape[0];
@@ -2604,15 +2702,21 @@ void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-    // Step 4: Dequantize and add bias
-    dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
-                        bias ? (__nv_bfloat16*)bias->data : nullptr,
-                        (float*)out.data, M, N);
+    // Step 4: Dequantize and add bias (optionally fused with GELU)
+    auto* bias_ptr = bias ? (__nv_bfloat16*)bias->data : nullptr;
+    if (apply_gelu) {
+        dequantize_bias_gelu(gemm_out, act_scales, (float*)weight.scales.data,
+                             bias_ptr, (float*)out.data, M, N);
+    } else {
+        dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
+                            bias_ptr, (float*)out.data, M, N);
+    }
 }
 
 // BF16 input × INT8 weight → FP32 output (with Hadamard rotation)
 void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
-                                 const Tensor* bias, Tensor& out, Tensor& scratch) {
+                                 const Tensor* bias, Tensor& out, Tensor& scratch,
+                                 bool apply_gelu) {
     int M = (int)x.shape[0];
     int K = (int)x.shape[1];
     int N = (int)weight.data.shape[0];
@@ -2652,10 +2756,15 @@ void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-    // Step 4: Dequantize and add bias
-    dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
-                        bias ? (__nv_bfloat16*)bias->data : nullptr,
-                        (float*)out.data, M, N);
+    // Step 4: Dequantize and add bias (optionally fused with GELU)
+    auto* bias_ptr = bias ? (__nv_bfloat16*)bias->data : nullptr;
+    if (apply_gelu) {
+        dequantize_bias_gelu(gemm_out, act_scales, (float*)weight.scales.data,
+                             bias_ptr, (float*)out.data, M, N);
+    } else {
+        dequantize_and_bias(gemm_out, act_scales, (float*)weight.scales.data,
+                            bias_ptr, (float*)out.data, M, N);
+    }
 }
 
 // Helper: quantize a BF16 weight tensor at load time (with Hadamard rotation)
@@ -4033,7 +4142,8 @@ bool g_w4a4_mode = false;
 // INT4+SVD linear forward: FP32 input, INT4 weight -> FP32 output
 // out = x @ R_dequant^T + x @ svd_down @ svd_up^T + bias
 void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
-                          const Tensor* bias, Tensor& out, Tensor& scratch) {
+                          const Tensor* bias, Tensor& out, Tensor& scratch,
+                          bool apply_gelu) {
     assert(x.dtype == DType::FP32);
     assert(out.dtype == DType::FP32);
     assert(weight.mode == QuantMode::INT4_SVD);
@@ -4228,11 +4338,16 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
                       (float*)out.data, M, N);
     }
+
+    if (apply_gelu) {
+        gelu_fp32((float*)out.data, (float*)out.data, (int64_t)M * N);
+    }
 }
 
 // BF16 native forward: FP32 input, BF16 weight → FP32 output
 static void linear_forward_bf16(const Tensor& x, const QuantizedWeight& weight,
-                                 const Tensor* bias, Tensor& out, Tensor& scratch) {
+                                 const Tensor* bias, Tensor& out, Tensor& scratch,
+                                 bool apply_gelu) {
     assert(x.dtype == DType::FP32);
     assert(out.dtype == DType::FP32);
     assert(weight.data.dtype == DType::BF16);
@@ -4259,6 +4374,10 @@ static void linear_forward_bf16(const Tensor& x, const QuantizedWeight& weight,
     if (bias) {
         bias_add_fp32((float*)out.data, (__nv_bfloat16*)bias->data,
                       (float*)out.data, M, N);
+    }
+
+    if (apply_gelu) {
+        gelu_fp32((float*)out.data, (float*)out.data, (int64_t)M * N);
     }
 }
 
@@ -4291,13 +4410,14 @@ static void linear_forward_bf16_bf16in(const Tensor& x, const QuantizedWeight& w
 
 // Unified dispatchers
 void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
-                               const Tensor* bias, Tensor& out, Tensor& scratch) {
+                               const Tensor* bias, Tensor& out, Tensor& scratch,
+                               bool apply_gelu) {
     if (weight.mode == QuantMode::BF16) {
-        linear_forward_bf16(x, weight, bias, out, scratch);
+        linear_forward_bf16(x, weight, bias, out, scratch, apply_gelu);
     } else if (weight.mode == QuantMode::INT4_SVD) {
-        linear_forward_int4(x, weight, bias, out, scratch);
+        linear_forward_int4(x, weight, bias, out, scratch, apply_gelu);
     } else {
-        linear_forward_int8(x, weight, bias, out, scratch);
+        linear_forward_int8(x, weight, bias, out, scratch, apply_gelu);
     }
 }
 

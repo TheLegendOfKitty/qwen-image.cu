@@ -268,14 +268,21 @@ void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const
                           const __nv_bfloat16* bias, float* out,
                           int M, int N, cudaStream_t stream = 0);
 
+// Fused dequantize + bias + GELU activation
+void dequantize_bias_gelu(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
+                           const __nv_bfloat16* bias, float* out,
+                           int M, int N, cudaStream_t stream = 0);
+
 // INT8 linear with Hadamard rotation: FP32 input × INT8 weight → FP32 output
 // Applies FWHT to activation before quantization to match weight rotation.
 void linear_forward_int8(const Tensor& x, const QuantizedWeight& weight,
-                          const Tensor* bias, Tensor& out, Tensor& scratch);
+                          const Tensor* bias, Tensor& out, Tensor& scratch,
+                          bool apply_gelu = false);
 
 // INT8 linear with Hadamard rotation: BF16 input × INT8 weight → FP32 output
 void linear_forward_int8_bf16in(const Tensor& x, const QuantizedWeight& weight,
-                                 const Tensor* bias, Tensor& out, Tensor& scratch);
+                                 const Tensor* bias, Tensor& out, Tensor& scratch,
+                                 bool apply_gelu = false);
 
 // Helper: quantize a BF16 weight tensor at load time (with Hadamard rotation)
 QuantizedWeight quantize_weight_tensor(const Tensor& bf16_weight);
@@ -375,11 +382,13 @@ void add_fp32(const float* a, const float* b, float* out, int64_t n, cudaStream_
 // When g_w4a4_mode is true, activations are also quantized to INT4 (simulated W4A4)
 extern bool g_w4a4_mode;
 void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
-                          const Tensor* bias, Tensor& out, Tensor& scratch);
+                          const Tensor* bias, Tensor& out, Tensor& scratch,
+                          bool apply_gelu = false);
 
 // Unified dispatchers: pick INT8 or INT4 based on weight.mode
 void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
-                               const Tensor* bias, Tensor& out, Tensor& scratch);
+                               const Tensor* bias, Tensor& out, Tensor& scratch,
+                               bool apply_gelu = false);
 void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& weight,
                                       const Tensor* bias, Tensor& out, Tensor& scratch);
 
@@ -479,6 +488,10 @@ void modulate_fp32(const float* x, const __nv_bfloat16* shift, const __nv_bfloat
                    float* out, int rows, int dim, cudaStream_t stream = 0);
 void modulate_fp32_f32params(const float* x, const float* shift, const float* scale,
                              float* out, int rows, int dim, cudaStream_t stream = 0);
+
+// Fused LayerNorm (no affine) + Modulate: FP32 in/out, FP32 shift/scale
+void layer_norm_modulate_fp32(const float* x, const float* shift, const float* scale,
+                               float* out, int rows, int dim, float eps = 1e-6f, cudaStream_t stream = 0);
 
 // GELU: FP32 in/out
 void gelu_fp32(const float* x, float* out, int64_t n, cudaStream_t stream = 0);

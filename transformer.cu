@@ -406,28 +406,20 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         // === ATTENTION PATH ===
 
-        // LayerNorm(FP32 residual) → FP32
+        // Fused LayerNorm + Modulate (FP32 residual → FP32)
         PROF_START();
-        layer_norm_no_affine_fp32((float*)img.data, (float*)img_normed_fp32.data,
-                                   n_img, inner_dim, 1e-6f);
-
-        if (dump_internal_block) dump_internal("img_ln.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
-
-        // Modulate(FP32, BF16 shift/scale) → FP32
-        modulate_fp32_f32params((float*)img_normed_fp32.data,
+        layer_norm_modulate_fp32((float*)img.data,
                       img_mods + 0 * inner_dim,  // shift1
                       img_mods + 1 * inner_dim,  // scale1
-                      (float*)img_normed_fp32.data, n_img, inner_dim);
+                      (float*)img_normed_fp32.data, n_img, inner_dim, 1e-6f);
 
         if (dump_internal_block) dump_internal("img_modulated.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
 
         // Same for txt
-        layer_norm_no_affine_fp32((float*)txt.data, (float*)txt_normed_fp32.data,
-                                   n_txt, inner_dim, 1e-6f);
-        modulate_fp32_f32params((float*)txt_normed_fp32.data,
+        layer_norm_modulate_fp32((float*)txt.data,
                       txt_mods + 0 * inner_dim,
                       txt_mods + 1 * inner_dim,
-                      (float*)txt_normed_fp32.data, n_txt, inner_dim);
+                      (float*)txt_normed_fp32.data, n_txt, inner_dim, 1e-6f);
 
         // Calibration: capture img_normed_fp32 for to_q/to_k/to_v (shared input)
         if (cal) {
@@ -600,21 +592,17 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         // === MLP PATH ===
 
-        // LayerNorm(FP32) → Modulate(FP32) → FP32 GEMMs
+        // Fused LayerNorm + Modulate → FP32 GEMMs
         PROF_START();
-        layer_norm_no_affine_fp32((float*)img.data, (float*)img_normed_fp32.data,
-                                   n_img, inner_dim, 1e-6f);
-        modulate_fp32_f32params((float*)img_normed_fp32.data,
+        layer_norm_modulate_fp32((float*)img.data,
                       img_mods + 3 * inner_dim,  // shift2
                       img_mods + 4 * inner_dim,  // scale2
-                      (float*)img_normed_fp32.data, n_img, inner_dim);
+                      (float*)img_normed_fp32.data, n_img, inner_dim, 1e-6f);
 
-        layer_norm_no_affine_fp32((float*)txt.data, (float*)txt_normed_fp32.data,
-                                   n_txt, inner_dim, 1e-6f);
-        modulate_fp32_f32params((float*)txt_normed_fp32.data,
+        layer_norm_modulate_fp32((float*)txt.data,
                       txt_mods + 3 * inner_dim,
                       txt_mods + 4 * inner_dim,
-                      (float*)txt_normed_fp32.data, n_txt, inner_dim);
+                      (float*)txt_normed_fp32.data, n_txt, inner_dim, 1e-6f);
 
         // Calibration: capture img_normed_fp32 for img_mlp_fc1
         if (cal) {
@@ -635,11 +623,8 @@ Tensor transformer_forward(const TransformerWeights& w,
         if (dump_internal_block) dump_internal("img_mlp_input.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
         {
             Tensor mlp_2d = img_mlp_fp32.view({n_img, mlp_dim});
-            linear_forward_quantized(img_normed_fp32, b.img_mlp_fc1_weight, &b.img_mlp_fc1_bias, mlp_2d, gemm_scratch);
+            linear_forward_quantized(img_normed_fp32, b.img_mlp_fc1_weight, &b.img_mlp_fc1_bias, mlp_2d, gemm_scratch, true);
             if (dump_internal_block) dump_internal("img_mlp_fc1.bin", img_mlp_fp32.data, (int64_t)n_img * mlp_dim, false);
-            // GELU in FP32
-            gelu_fp32((float*)img_mlp_fp32.data, (float*)img_mlp_fp32.data,
-                      (int64_t)n_img * mlp_dim);
             if (dump_internal_block) dump_internal("img_mlp_gelu.bin", img_mlp_fp32.data, (int64_t)n_img * mlp_dim, false);
             // Calibration: capture img_mlp_fp32 (post-GELU) for img_mlp_fc2
             if (cal) {
@@ -658,9 +643,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         }
         {
             Tensor mlp_2d = txt_mlp_fp32.view({n_txt, mlp_dim});
-            linear_forward_quantized(txt_normed_fp32, b.txt_mlp_fc1_weight, &b.txt_mlp_fc1_bias, mlp_2d, gemm_scratch);
-            gelu_fp32((float*)txt_mlp_fp32.data, (float*)txt_mlp_fp32.data,
-                      (int64_t)n_txt * mlp_dim);
+            linear_forward_quantized(txt_normed_fp32, b.txt_mlp_fc1_weight, &b.txt_mlp_fc1_bias, mlp_2d, gemm_scratch, true);
             Tensor out_2d = txt_mlp_out.view({n_txt, inner_dim});
             linear_forward_quantized(txt_mlp_fp32, b.txt_mlp_fc2_weight, &b.txt_mlp_fc2_bias, out_2d, gemm_scratch);
         }
@@ -727,11 +710,10 @@ Tensor transformer_forward(const TransformerWeights& w,
     auto* ada_mods = (float*)ada_emb.data;
 
     // Final AdaLayerNormContinuous in FP32, convert to BF16 only after proj_out.
-    layer_norm_no_affine_fp32((float*)img.data, (float*)img_normed_fp32.data, n_img, inner_dim, 1e-6f);
-    modulate_fp32_f32params((float*)img_normed_fp32.data,
+    layer_norm_modulate_fp32((float*)img.data,
                             ada_mods + inner_dim,   // shift (second half)
                             ada_mods + 0,           // scale (first half)
-                            (float*)img_normed_fp32.data, n_img, inner_dim);
+                            (float*)img_normed_fp32.data, n_img, inner_dim, 1e-6f);
 
     dump("cuda_img_after_adanorm.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
 
