@@ -256,13 +256,6 @@ void quantize_activation_per_token_fp32(const float* x, int8_t* out, float* scal
 void quantize_activation_per_token_bf16(const __nv_bfloat16* x, int8_t* out, float* scales,
                                          int M, int K, cudaStream_t stream = 0);
 
-// Fused FWHT (shared memory) + per-token INT8 quantization
-// Out-of-place: reads from input, does FWHT in shared memory, quantizes to INT8.
-void fwht_quantize_fp32(const float* input, int8_t* output, float* scales,
-                         int M, int K, int had_block_size, cudaStream_t stream = 0);
-void fwht_quantize_bf16(const __nv_bfloat16* input, int8_t* output, float* scales,
-                          int M, int K, int had_block_size, cudaStream_t stream = 0);
-
 // Dequantize INT32 GEMM output: out_fp32[i,j] = gemm_out[i,j] * act_scale[i] * w_scale[j] + bias[j]
 void dequantize_and_bias(const int32_t* gemm_out, const float* act_scales, const float* w_scales,
                           const __nv_bfloat16* bias, float* out,
