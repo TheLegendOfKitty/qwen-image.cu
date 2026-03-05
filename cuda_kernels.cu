@@ -657,6 +657,80 @@ void softmax(const float* x, float* out, int rows, int cols, cudaStream_t stream
     softmax_kernel<<<rows, threads, 0, stream>>>(x, out, rows, cols);
 }
 
+// Fused softmax → FP16 output using 2-pass online softmax
+// Pass 1: compute max and sum simultaneously (online algorithm)
+// Pass 2: compute exp(x-max)/sum and write as FP16
+__global__ void softmax_fp16out_kernel(const float* __restrict__ x,
+                                        __half* __restrict__ out,
+                                        int rows, int cols) {
+    int row = blockIdx.x;
+    const float* x_row = x + (int64_t)row * cols;
+    __half* o_row = out + (int64_t)row * cols;
+
+    // Online softmax: track running max and running sum
+    float max_val = -FLT_MAX;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = x_row[i];
+        if (v > max_val) {
+            sum = sum * expf(max_val - v) + expf(0.0f);  // correct previous sum + add 1
+            max_val = v;
+        } else {
+            sum += expf(v - max_val);
+        }
+    }
+
+    // Warp reduce max (keeping sums corrected)
+    __shared__ float s_max[32], s_sum[32];
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
+        float other_sum = __shfl_down_sync(0xffffffff, sum, offset);
+        if (other_max > max_val) {
+            sum = sum * expf(max_val - other_max) + other_sum;
+            max_val = other_max;
+        } else {
+            sum += other_sum * expf(other_max - max_val);
+        }
+    }
+
+    if (lane == 0) { s_max[warp] = max_val; s_sum[warp] = sum; }
+    __syncthreads();
+
+    // Final reduce across warps in warp 0
+    int num_warps = blockDim.x / 32;
+    if (warp == 0) {
+        max_val = (lane < num_warps) ? s_max[lane] : -FLT_MAX;
+        sum = (lane < num_warps) ? s_sum[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
+            float other_sum = __shfl_down_sync(0xffffffff, sum, offset);
+            if (other_max > max_val) {
+                sum = sum * expf(max_val - other_max) + other_sum;
+                max_val = other_max;
+            } else {
+                sum += other_sum * expf(other_max - max_val);
+            }
+        }
+        if (lane == 0) { s_max[0] = max_val; s_sum[0] = sum; }
+    }
+    __syncthreads();
+
+    max_val = s_max[0];
+    float inv_sum = 1.0f / s_sum[0];
+
+    // Pass 2: compute normalized softmax and write as FP16
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        o_row[i] = __float2half(expf(x_row[i] - max_val) * inv_sum);
+}
+
+void softmax_fp16out(const float* x, __half* out, int rows, int cols, cudaStream_t stream) {
+    int threads = min(1024, ((cols + 31) / 32) * 32);
+    softmax_fp16out_kernel<<<rows, threads, 0, stream>>>(x, out, rows, cols);
+}
+
 // ==================== Embedding ====================
 
 __global__ void embedding_kernel(const __nv_bfloat16* table, const int32_t* indices,
@@ -1902,11 +1976,10 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
 
     if (causal) apply_causal_mask(scores, BH, S, stream);
 
-    // Softmax (FP32)
-    softmax(scores, scores, BH * S, S, stream);
+    // Fused softmax → FP16 output (2-pass online softmax, no intermediate FP32)
+    softmax_fp16out(scores, scores_fp16, BH * S, S, stream);
 
-    // Convert softmax output and V to FP16 for tensor core GEMM
-    fp32_to_fp16(scores, scores_fp16, (int64_t)BH * S * S, stream);
+    // Convert V to FP16 for tensor core GEMM
     fp32_to_fp16(v, v_fp16, (int64_t)BH * S * D, stream);
 
     // scores × V: FP16 × FP16 → FP32 output (tensor cores)
