@@ -1855,18 +1855,35 @@ void split_seq_fp32(const float* in, float* a, float* b,
 void attention_forward_fp32io(const float* q, const float* k, const float* v,
                                float* out, float scale, int BH, int S, int D,
                                bool causal, cudaStream_t stream) {
-    float* scores;
-    __half* q_fp16;
-    __half* k_fp16;
-    CUDA_CHECK(cudaMalloc(&scores, (size_t)BH * S * S * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&q_fp16, (size_t)BH * S * D * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&k_fp16, (size_t)BH * S * D * sizeof(__half)));
+    // Pre-allocated persistent buffers (avoid cudaMalloc/Free per call)
+    static float* scores = nullptr;
+    static __half* qkv_fp16 = nullptr;  // holds q_fp16, k_fp16 contiguously
+    static size_t scores_cap = 0;
+    static size_t qkv_cap = 0;
+
+    size_t scores_need = (size_t)BH * S * S * sizeof(float);
+    size_t qkv_need = (size_t)BH * S * D * sizeof(__half) * 2;  // q + k in FP16
+
+    if (scores_need > scores_cap) {
+        if (scores) cudaFree(scores);
+        CUDA_CHECK(cudaMalloc(&scores, scores_need));
+        scores_cap = scores_need;
+    }
+    if (qkv_need > qkv_cap) {
+        if (qkv_fp16) cudaFree(qkv_fp16);
+        CUDA_CHECK(cudaMalloc(&qkv_fp16, qkv_need));
+        qkv_cap = qkv_need;
+    }
+
+    __half* q_fp16 = qkv_fp16;
+    __half* k_fp16 = qkv_fp16 + (size_t)BH * S * D;
 
     fp32_to_fp16(q, q_fp16, (int64_t)BH * S * D, stream);
     fp32_to_fp16(k, k_fp16, (int64_t)BH * S * D, stream);
 
     float alpha = scale, beta_val = 0.0f;
 
+    // Q × K^T: FP16 × FP16 → FP32 (tensor cores)
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
         cublas(),
         CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1877,7 +1894,7 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
         &beta_val,
         scores, CUDA_R_32F, S, (long long)S * S,
         BH,
-        CUBLAS_COMPUTE_32F_PEDANTIC,
+        CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (causal) apply_causal_mask(scores, BH, S, stream);
@@ -1885,7 +1902,8 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
     // Softmax (FP32)
     softmax(scores, scores, BH * S, S, stream);
 
-    // scores @ V: FP32 × FP32 -> FP32 output
+    // scores × V: FP32 × FP16 → FP32 output
+    // cuBLAS doesn't support mixed FP32/FP16, so use FP32 for both
     alpha = 1.0f;
     beta_val = 0.0f;
     CUBLAS_CHECK(cublasGemmStridedBatchedEx(
@@ -1898,11 +1916,8 @@ void attention_forward_fp32io(const float* q, const float* k, const float* v,
         &beta_val,
         out, CUDA_R_32F, D, (long long)S * D,
         BH,
-        CUBLAS_COMPUTE_32F_PEDANTIC,
+        CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    CUDA_CHECK(cudaFree(q_fp16));
-    CUDA_CHECK(cudaFree(k_fp16));
-    CUDA_CHECK(cudaFree(scores));
 }
 
 void attention_forward_fp32(const float* q, const float* k, const float* v,
@@ -3094,6 +3109,86 @@ void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_sc
         x, act_packed, act_scales, M, K, group_size);
 }
 
+// Fused kernel: smooth_div + fp32_to_bf16 + quantize_activation_int4
+// Reads input once, writes BF16 (for LoRA) + INT4 packed + scales in one pass.
+__global__ void fused_smooth_bf16_quant_kernel(
+    const float* __restrict__ x,           // [M, K] FP32 input
+    const float* __restrict__ smooth,      // [K] FP32 smooth factors (or nullptr)
+    __nv_bfloat16* __restrict__ bf16_out,  // [M, K] BF16 output for LoRA
+    uint8_t* __restrict__ act_packed,      // [M, K/2] INT4 packed output
+    float* __restrict__ act_scales,        // [num_groups, M] FP32 scales
+    int M, int K, int group_size)
+{
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    if (row >= M) return;
+
+    int col_start = group * group_size;
+    const float* grp = x + (int64_t)row * K + col_start;
+
+    // Phase 1: Read input, apply smooth, write BF16, find absmax
+    extern __shared__ float s_vals[];  // group_size floats
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float v = grp[i];
+        if (smooth) v /= smooth[col_start + i];
+        s_vals[i] = v;
+        // Write BF16 for LoRA path
+        bf16_out[(int64_t)row * K + col_start + i] = __float2bfloat16(v);
+        float a = fabsf(v);
+        if (a > max_abs) max_abs = a;
+    }
+
+    // Warp-reduce absmax
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    __shared__ float s_max[8];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) s_max[warp_id] = max_abs;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        max_abs = (lane < nwarps) ? s_max[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_max[0] = max_abs;
+    __syncthreads();
+    max_abs = s_max[0];
+
+    float scale = max_abs / 7.0f;
+    float inv_scale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+
+    int num_groups = K / group_size;
+    if (threadIdx.x == 0)
+        act_scales[group * M + row] = scale;
+
+    // Phase 2: Quantize from shared memory and pack
+    int half_gs = group_size / 2;
+    for (int i = threadIdx.x; i < half_gs; i += blockDim.x) {
+        float v0 = s_vals[i * 2];
+        float v1 = s_vals[i * 2 + 1];
+        int q0 = (int)roundf(v0 * inv_scale); q0 = max(-7, min(7, q0));
+        int q1 = (int)roundf(v1 * inv_scale); q1 = max(-7, min(7, q1));
+        uint8_t packed = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4));
+        act_packed[(int64_t)row * (K / 2) + (col_start / 2) + i] = packed;
+    }
+}
+
+void fused_smooth_bf16_quant(const float* x, const float* smooth,
+                              __nv_bfloat16* bf16_out,
+                              uint8_t* act_packed, float* act_scales,
+                              int M, int K, int group_size, cudaStream_t stream) {
+    int num_groups = K / group_size;
+    dim3 grid(M, num_groups);
+    int block = min(256, group_size);
+    int shmem = group_size * sizeof(float);
+    fused_smooth_bf16_quant_kernel<<<grid, block, shmem, stream>>>(
+        x, smooth, bf16_out, act_packed, act_scales, M, K, group_size);
+}
+
 // ================================================================
 // W4A4 INT4×INT4 GEMM — Naive scalar kernel (fallback)
 // ================================================================
@@ -3275,10 +3370,11 @@ __global__ void w4a4_gemm_mma_kernel(
     const int num_groups = K / group_size;
     const int half_gs = group_size / 2;  // 32 bytes for gs=64
 
-    // Shared memory: 64 rows × 9 uint32 (32 data bytes + 4 padding bytes)
-    // Padding avoids bank conflicts: stride=9 words, gcd(9,32)=1
-    __shared__ uint32_t shmem_a[64][9];
-    __shared__ uint32_t shmem_w[64][9];
+    // Double-buffered shared memory with cp.async for software pipelining
+    // cp.async copies global→shared directly (no register stall), enabling
+    // overlap of next-group prefetch with current-group MMA compute
+    __shared__ uint32_t shmem_a[2][64][9];
+    __shared__ uint32_t shmem_w[2][64][9];
 
     // FP32 accumulators: [mt][nt][mma_half][d_idx] = 2×2×2×4 = 32 per thread
     float acc[2][2][2][4];
@@ -3292,29 +3388,71 @@ __global__ void w4a4_gemm_mma_kernel(
                 for (int l = 0; l < 4; l++)
                     acc[i][j][k][l] = 0.0f;
 
-    for (int g = 0; g < num_groups; g++) {
-        const int k_byte_start = g * half_gs;
-
-        // Cooperative load: 128 threads load 64×8 uint32 for each tile
-        // Each thread loads 4 uint32 per tile (512 / 128 = 4)
+    // Preload group 0 into buffer 0 using cp.async
+    {
         #pragma unroll
         for (int i = threadIdx.x; i < 64 * 8; i += 128) {
             const int row = i / 8;
             const int col = i % 8;
 
             const int ma = bm + row;
-            shmem_a[row][col] = (ma < M) ?
-                ((const uint32_t*)(act_packed + (int64_t)ma * (K/2) + k_byte_start))[col] : 0;
+            if (ma < M) {
+                uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_a[0][row][col]));
+                const void* src = &((const uint32_t*)(act_packed + (int64_t)ma * (K/2)))[col];
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(src));
+            } else {
+                shmem_a[0][row][col] = 0;
+            }
 
             const int na = bn + row;
-            shmem_w[row][col] = (na < N) ?
-                ((const uint32_t*)(wgt_packed + (int64_t)na * (K/2) + k_byte_start))[col] : 0;
+            if (na < N) {
+                uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_w[0][row][col]));
+                const void* src = &((const uint32_t*)(wgt_packed + (int64_t)na * (K/2)))[col];
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(src));
+            } else {
+                shmem_w[0][row][col] = 0;
+            }
         }
-        __syncthreads();
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();
+
+    for (int g = 0; g < num_groups; g++) {
+        const int cur = g & 1;
+        const int nxt = 1 - cur;
+
+        // Prefetch next group into buf[nxt] using cp.async (non-blocking)
+        if (g + 1 < num_groups) {
+            const int k_byte_start_nxt = (g + 1) * half_gs;
+            #pragma unroll
+            for (int i = threadIdx.x; i < 64 * 8; i += 128) {
+                const int row = i / 8;
+                const int col = i % 8;
+
+                const int ma = bm + row;
+                if (ma < M) {
+                    uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_a[nxt][row][col]));
+                    const void* src = &((const uint32_t*)(act_packed + (int64_t)ma * (K/2) + k_byte_start_nxt))[col];
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(src));
+                } else {
+                    shmem_a[nxt][row][col] = 0;
+                }
+
+                const int na = bn + row;
+                if (na < N) {
+                    uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_w[nxt][row][col]));
+                    const void* src = &((const uint32_t*)(wgt_packed + (int64_t)na * (K/2) + k_byte_start_nxt))[col];
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst), "l"(src));
+                } else {
+                    shmem_w[nxt][row][col] = 0;
+                }
+            }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        }
 
         // Load act scales for this thread's 4 M positions
-        // Positions: warp_m*32 + mt*16 + {gid, gid+8} for mt=0,1
-        float as[4];  // as[mt*2 + hi]: hi=0 for gid row, hi=1 for gid+8 row
+        float as[4];
         #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
             const int m0 = bm + warp_m * 32 + mt * 16 + gid;
@@ -3324,8 +3462,7 @@ __global__ void w4a4_gemm_mma_kernel(
         }
 
         // Load wgt scales for this thread's 8 N positions
-        // Positions: warp_n*32 + nt*16 + mh*8 + {tid*2, tid*2+1} for nt=0,1 mh=0,1
-        float ws[8];  // ws[nt*4 + mh*2 + parity]
+        float ws[8];
         #pragma unroll
         for (int nt = 0; nt < 2; nt++) {
             #pragma unroll
@@ -3338,48 +3475,31 @@ __global__ void w4a4_gemm_mma_kernel(
             }
         }
 
-        // MMA loop: 2 M-tiles × 2 N-tiles × 2 MMA calls = 8 MMAs
+        // Compute: load MMA fragments from buf[cur], run 8 MMAs, dequant+accumulate
         #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
-            // Load A fragment from shmem (reused across N-tiles)
-            // MMA A (row-major m16×k64, .s4), register layout:
-            //   a[0] = row_lo, k_first_half  → shmem_a[gid][tid]
-            //   a[1] = row_hi, k_first_half  → shmem_a[gid+8][tid]
-            //   a[2] = row_lo, k_second_half → shmem_a[gid][4+tid]
-            //   a[3] = row_hi, k_second_half → shmem_a[gid+8][4+tid]
             uint32_t a[4];
             const int m_base = warp_m * 32 + mt * 16;
-            a[0] = shmem_a[m_base + gid][tid];
-            a[1] = shmem_a[m_base + gid + 8][tid];
-            a[2] = shmem_a[m_base + gid][4 + tid];
-            a[3] = shmem_a[m_base + gid + 8][4 + tid];
+            a[0] = shmem_a[cur][m_base + gid][tid];
+            a[1] = shmem_a[cur][m_base + gid + 8][tid];
+            a[2] = shmem_a[cur][m_base + gid][4 + tid];
+            a[3] = shmem_a[cur][m_base + gid + 8][4 + tid];
 
             #pragma unroll
             for (int nt = 0; nt < 2; nt++) {
                 #pragma unroll
                 for (int mh = 0; mh < 2; mh++) {
-                    // Load B fragment from shmem
-                    // MMA B (col-major k64×n8, .s4), register layout:
-                    //   b[0] = B[tid*8..tid*8+7, gid]       → shmem_w[n+gid][tid]    (K first 32)
-                    //   b[1] = B[32+tid*8..32+tid*8+7, gid] → shmem_w[n+gid][4+tid]  (K second 32)
                     uint32_t b[2];
                     const int n_start = warp_n * 32 + nt * 16 + mh * 8;
-                    b[0] = shmem_w[n_start + gid][tid];
-                    b[1] = shmem_w[n_start + gid][4 + tid];
+                    b[0] = shmem_w[cur][n_start + gid][tid];
+                    b[1] = shmem_w[cur][n_start + gid][4 + tid];
 
-                    // MMA: d = a * b + 0
                     int32_t zeros[4] = {0, 0, 0, 0};
                     int32_t d[4];
                     mma_s4s4_m16n8k64(a, b, zeros, d);
 
-                    // Dequantize and accumulate
-                    // D output mapping:
-                    //   d[0] = D[gid, tid*2]      → m=m_base+gid,   n=n_start+tid*2
-                    //   d[1] = D[gid, tid*2+1]    → m=m_base+gid,   n=n_start+tid*2+1
-                    //   d[2] = D[gid+8, tid*2]    → m=m_base+gid+8, n=n_start+tid*2
-                    //   d[3] = D[gid+8, tid*2+1]  → m=m_base+gid+8, n=n_start+tid*2+1
-                    const float as_lo = as[mt * 2];      // scale for row gid
-                    const float as_hi = as[mt * 2 + 1];  // scale for row gid+8
+                    const float as_lo = as[mt * 2];
+                    const float as_hi = as[mt * 2 + 1];
                     const int ws_idx = nt * 4 + mh * 2;
 
                     acc[mt][nt][mh][0] += (float)d[0] * as_lo * ws[ws_idx];
@@ -3389,6 +3509,9 @@ __global__ void w4a4_gemm_mma_kernel(
                 }
             }
         }
+
+        // Wait for cp.async prefetch to complete, then sync all threads
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
     }
 
@@ -3412,20 +3535,242 @@ __global__ void w4a4_gemm_mma_kernel(
     }
 }
 
+// ================================================================
+// Weight swizzle: row-major → MMA fragment order for register-direct GEMM
+// Layout: wgt_mma[g, nt, lane*2..lane*2+1] where lane = gid*4+tid
+//   wgt_mma[g,nt,lane*2]   = wgt_rowmajor[nt*8+gid][ g*half_gs + tid*4     : +4 ] as uint32
+//   wgt_mma[g,nt,lane*2+1] = wgt_rowmajor[nt*8+gid][ g*half_gs + (4+tid)*4 : +4 ] as uint32
+// Grid: (num_groups, N_tiles8), Block: 32 threads
+// ================================================================
+__global__ void swizzle_w4a4_weights_kernel(
+    const uint8_t* __restrict__ wgt_rowmajor,  // [N, K/2]
+    uint32_t* __restrict__ wgt_mma,            // [num_groups, N_tiles8, 64]
+    int N, int K, int group_size)
+{
+    const int g = blockIdx.x;       // group index
+    const int nt = blockIdx.y;      // N tile index (0..N_tiles8-1)
+    const int lane = threadIdx.x;   // 0..31
+    const int gid = lane / 4;      // 0..7
+    const int tid = lane % 4;      // 0..3
+
+    const int half_gs = group_size / 2;
+    const int K_half = K / 2;
+    const int N_tiles8 = (N + 7) / 8;
+
+    const int row = nt * 8 + gid;
+    uint32_t* out = wgt_mma + ((int64_t)g * N_tiles8 + nt) * 64;
+
+    if (row >= N) {
+        out[lane * 2]     = 0;
+        out[lane * 2 + 1] = 0;
+        return;
+    }
+
+    const uint32_t* row_data = (const uint32_t*)(wgt_rowmajor + (int64_t)row * K_half + g * half_gs);
+    out[lane * 2]     = row_data[tid];
+    out[lane * 2 + 1] = row_data[4 + tid];
+}
+
+void swizzle_w4a4_weights_mma(const uint8_t* wgt_rowmajor, uint32_t* wgt_mma,
+                               int N, int K, int group_size, cudaStream_t stream) {
+    int num_groups = K / group_size;
+    int N_tiles8 = (N + 7) / 8;
+    dim3 grid(num_groups, N_tiles8);
+    dim3 block(32);
+    swizzle_w4a4_weights_kernel<<<grid, block, 0, stream>>>(
+        wgt_rowmajor, wgt_mma, N, K, group_size);
+}
+
+// ================================================================
+// W4A4 INT4×INT4 GEMM — Register-Direct kernel (no shared memory)
+// Loads data directly from global memory into MMA fragment registers.
+// No shared memory, no __syncthreads — warps execute fully independently.
+// BLOCK_M=64, BLOCK_N=64, 4 warps stacked along M (WARP_M=16, WARP_N=64)
+// Per warp per K-step: 8 MMAs (1 m-tile × 8 n-tiles of m16×n8)
+// Weights must be in MMA fragment order (from swizzle_w4a4_weights_mma).
+// ================================================================
+__global__ void w4a4_gemm_regdirect_kernel(
+    const uint8_t* __restrict__ act_packed,    // [M, K/2] UINT8
+    const uint32_t* __restrict__ wgt_mma,      // [num_groups, N_tiles8, 64] UINT32
+    const float* __restrict__ act_scales,      // [num_groups, M] FP32
+    const float* __restrict__ wgt_scales,      // [num_groups, N] FP32
+    float* __restrict__ output,                // [M, N] FP32
+    int M, int N, int K, int group_size,
+    bool accumulate)                           // if true, output[i] += result instead of output[i] = result
+{
+    // M-tile-major ordering: blockIdx.x = M-tile, blockIdx.y = N-tile
+    // This maximizes L2 cache reuse for weight data (all M-blocks for same N-tile
+    // run consecutively, sharing weight data in L2 cache)
+    const int bm = blockIdx.x * 64;
+    const int bn = blockIdx.y * 64;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int gid = lane / 4;
+    const int tid = lane % 4;
+
+    // 2×2 warp layout: reduces weight load redundancy from 4× to 2×
+    const int warp_m = warp_id / 2;  // 0 or 1
+    const int warp_n = warp_id % 2;  // 0 or 1
+
+    const int num_groups = K / group_size;
+    const int half_gs = group_size / 2;
+    const int K_half = K / 2;
+    const int N_tiles8 = (N + 7) / 8;
+
+    // Accumulators: 2 mt × 4 nt × 4 elements = 32 floats per thread
+    float acc[2][4][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int k = 0; k < 4; k++)
+                acc[i][j][k] = 0.0f;
+
+    // Precompute row pointers for 2 m-tiles (32 M rows per warp)
+    const int m_base = bm + warp_m * 32;
+    const uint32_t* a_rows[4];  // [mt][lo/hi]
+    int m_vals[4];
+    #pragma unroll
+    for (int mt = 0; mt < 2; mt++) {
+        m_vals[mt * 2]     = m_base + mt * 16 + gid;
+        m_vals[mt * 2 + 1] = m_base + mt * 16 + gid + 8;
+        a_rows[mt * 2]     = (m_vals[mt * 2] < M)     ? (const uint32_t*)(act_packed + (int64_t)m_vals[mt * 2] * K_half) : nullptr;
+        a_rows[mt * 2 + 1] = (m_vals[mt * 2 + 1] < M) ? (const uint32_t*)(act_packed + (int64_t)m_vals[mt * 2 + 1] * K_half) : nullptr;
+    }
+
+    const int bn_tile = bn / 8 + warp_n * 4;  // first n-tile for this warp's N half
+
+    for (int g = 0; g < num_groups; g++) {
+        const int k_u32_start = g * (half_gs / 4);
+
+        // Preload all 4 B fragments for this warp's N half (reused across mt=0,1)
+        uint32_t b_all[4][2];
+        float ws_all[8];
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            const int nt_global = bn_tile + nt;
+            if (nt_global < N_tiles8) {
+                const uint32_t* b_ptr = wgt_mma + ((int64_t)g * N_tiles8 + nt_global) * 64 + lane * 2;
+                b_all[nt][0] = b_ptr[0];
+                b_all[nt][1] = b_ptr[1];
+            } else {
+                b_all[nt][0] = 0; b_all[nt][1] = 0;
+            }
+            const int n0 = bn + warp_n * 32 + nt * 8 + tid * 2;
+            ws_all[nt * 2]     = (n0 < N)     ? wgt_scales[g * N + n0] : 0.0f;
+            ws_all[nt * 2 + 1] = (n0 + 1 < N) ? wgt_scales[g * N + n0 + 1] : 0.0f;
+        }
+
+        // Process 2 m-tiles, each reusing the preloaded B fragments
+        #pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            // Load A fragment for this m-tile
+            uint32_t a[4];
+            if (a_rows[mt * 2]) {
+                a[0] = a_rows[mt * 2][k_u32_start + tid];
+                a[2] = a_rows[mt * 2][k_u32_start + 4 + tid];
+            } else {
+                a[0] = 0; a[2] = 0;
+            }
+            if (a_rows[mt * 2 + 1]) {
+                a[1] = a_rows[mt * 2 + 1][k_u32_start + tid];
+                a[3] = a_rows[mt * 2 + 1][k_u32_start + 4 + tid];
+            } else {
+                a[1] = 0; a[3] = 0;
+            }
+
+            const float as_lo = (m_vals[mt * 2] < M)     ? act_scales[g * M + m_vals[mt * 2]] : 0.0f;
+            const float as_hi = (m_vals[mt * 2 + 1] < M) ? act_scales[g * M + m_vals[mt * 2 + 1]] : 0.0f;
+
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                int32_t zeros[4] = {0, 0, 0, 0};
+                int32_t d[4];
+                mma_s4s4_m16n8k64(a, b_all[nt], zeros, d);
+
+                acc[mt][nt][0] += (float)d[0] * as_lo * ws_all[nt * 2];
+                acc[mt][nt][1] += (float)d[1] * as_lo * ws_all[nt * 2 + 1];
+                acc[mt][nt][2] += (float)d[2] * as_hi * ws_all[nt * 2];
+                acc[mt][nt][3] += (float)d[3] * as_hi * ws_all[nt * 2 + 1];
+            }
+        }
+    }
+
+    // Write output (accumulate mode: add to existing values e.g. LoRA output)
+    #pragma unroll
+    for (int mt = 0; mt < 2; mt++) {
+        const int m0 = m_vals[mt * 2];
+        const int m1 = m_vals[mt * 2 + 1];
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            const int n0 = bn + warp_n * 32 + nt * 8 + tid * 2;
+            const int n1 = n0 + 1;
+            if (accumulate) {
+                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] += acc[mt][nt][0];
+                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] += acc[mt][nt][1];
+                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] += acc[mt][nt][2];
+                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] += acc[mt][nt][3];
+            } else {
+                if (m0 < M && n0 < N) output[(int64_t)m0 * N + n0] = acc[mt][nt][0];
+                if (m0 < M && n1 < N) output[(int64_t)m0 * N + n1] = acc[mt][nt][1];
+                if (m1 < M && n0 < N) output[(int64_t)m1 * N + n0] = acc[mt][nt][2];
+                if (m1 < M && n1 < N) output[(int64_t)m1 * N + n1] = acc[mt][nt][3];
+            }
+        }
+    }
+}
+
 void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
                const float* act_scales, const float* wgt_scales,
-               float* output, int M, int N, int K, int group_size, cudaStream_t stream) {
+               float* output, int M, int N, int K, int group_size,
+               const uint32_t* wgt_mma, bool accumulate, cudaStream_t stream) {
     static int force_naive = -1;
     if (force_naive < 0) force_naive = (getenv("FORCE_NAIVE_W4A4") != nullptr) ? 1 : 0;
+    static int force_shmem = -1;
+    if (force_shmem < 0) force_shmem = (getenv("FORCE_SHMEM_W4A4") != nullptr) ? 1 : 0;
+    static int verify_mma = -1;
+    if (verify_mma < 0) verify_mma = (getenv("VERIFY_MMA_W4A4") != nullptr) ? 1 : 0;
 
     if (force_naive) {
-        // Naive scalar kernel: BM=32, BN=64, 128 threads
         dim3 block(128);
         dim3 grid((N + W4A4_BN - 1) / W4A4_BN, (M + W4A4_BM - 1) / W4A4_BM);
         w4a4_gemm_naive_kernel<<<grid, block, 0, stream>>>(
             act_packed, wgt_packed, act_scales, wgt_scales, output, M, N, K, group_size);
+    } else if (wgt_mma && !force_shmem) {
+        dim3 block(128);
+        dim3 grid((M + 63) / 64, (N + 63) / 64);  // M-tile-major for L2 cache reuse
+        w4a4_gemm_regdirect_kernel<<<grid, block, 0, stream>>>(
+            act_packed, wgt_mma, act_scales, wgt_scales, output, M, N, K, group_size, accumulate);
+
+        // Verify regdirect vs shmem kernel (spot-check first few calls)
+        if (verify_mma) {
+            static int verify_count = 0;
+            if (verify_count < 3) {
+                verify_count++;
+                float* ref_output;
+                cudaMalloc(&ref_output, (int64_t)M * N * sizeof(float));
+                w4a4_gemm_mma_kernel<<<grid, block, 0, stream>>>(
+                    act_packed, wgt_packed, act_scales, wgt_scales, ref_output, M, N, K, group_size);
+                cudaDeviceSynchronize();
+
+                // Spot-check 64 elements
+                int check = std::min(64, M * N);
+                std::vector<float> rd(check), sm(check);
+                cudaMemcpy(rd.data(), output, check * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(sm.data(), ref_output, check * sizeof(float), cudaMemcpyDeviceToHost);
+                int mismatches = 0;
+                double max_diff = 0;
+                for (int i = 0; i < check; i++) {
+                    if (rd[i] != sm[i]) { mismatches++; double d = fabs(rd[i] - sm[i]); if (d > max_diff) max_diff = d; }
+                }
+                fprintf(stderr, "  [VERIFY_MMA_W4A4 #%d] M=%d N=%d K=%d: first-%d mismatches=%d max_diff=%.6f\n",
+                        verify_count, M, N, K, check, mismatches, max_diff);
+                cudaFree(ref_output);
+            }
+        }
     } else {
-        // MMA tensor core kernel: BM=64, BN=64, 128 threads (4 warps)
         dim3 block(128);
         dim3 grid((N + 63) / 64, (M + 63) / 64);
         w4a4_gemm_mma_kernel<<<grid, block, 0, stream>>>(
@@ -3481,17 +3826,53 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
 
     bool has_smooth = (weight.smooth.data != nullptr);
+    bool use_w4a4 = weight.nunchaku_swizzle && weight.qweight_rowmajor.data && !getenv("FORCE_W4A16");
 
-    // 1. Low-rank path: x → /smooth → BF16 → low-rank GEMMs → out
-    if (has_smooth) {
-        // Apply smooth division in FP32, then convert to BF16
-        apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
-        fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
-    } else {
-        fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+    // Internal profiling (activated with PROFILE_LINEAR env var)
+    static bool profile_linear = (getenv("PROFILE_LINEAR") != nullptr);
+    static float prof_prep = 0, prof_lora = 0, prof_w4a4 = 0, prof_other = 0;
+    static int prof_count = 0;
+    static cudaEvent_t pl_start, pl_end;
+    static bool pl_inited = false;
+    if (profile_linear && !pl_inited) {
+        cudaEventCreate(&pl_start); cudaEventCreate(&pl_end); pl_inited = true;
     }
+    #define PL_START() do { if (profile_linear) cudaEventRecord(pl_start); } while(0)
+    #define PL_END(acc) do { if (profile_linear) { cudaEventRecord(pl_end); cudaEventSynchronize(pl_end); \
+        float ms; cudaEventElapsedTime(&ms, pl_start, pl_end); acc += ms; } } while(0)
+
+    // For W4A4 path: fused smooth_div + bf16 conversion + INT4 quantization in one pass
+    // For non-W4A4 paths: separate smooth_div + bf16 conversion
+    int num_groups = K / weight.group_size;
+    uint8_t* act_packed = (uint8_t*)deq_w;
+    float* act_scales_ptr = (float*)((char*)act_packed + (((int64_t)M * (K / 2) + 255) & ~255LL));
+
+    PL_START();
+    if (use_w4a4) {
+        static int w4a4_count = 0;
+        if (w4a4_count < 2) {
+            fprintf(stderr, "  [W4A4 path] M=%d K=%d N=%d r=%d gs=%d smooth=%d\n",
+                    M, K, N, r, weight.group_size, has_smooth ? 1 : 0);
+            w4a4_count++;
+        }
+        // Fused: read x once → write bf16_x + act_packed + act_scales
+        fused_smooth_bf16_quant((const float*)x.data,
+                                has_smooth ? (const float*)weight.smooth.data : nullptr,
+                                bf16_x, act_packed, act_scales_ptr,
+                                M, K, weight.group_size);
+    } else {
+        // Non-W4A4: separate smooth + bf16 conversion
+        if (has_smooth) {
+            apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
+            fp32_to_bf16(fp32_tmp, bf16_x, (int64_t)M * K);
+        } else {
+            fp32_to_bf16((const float*)x.data, bf16_x, (int64_t)M * K);
+        }
+    }
+    PL_END(prof_prep);
 
     // 2. Low-rank down: lr_tmp[M,r] = bf16_x[M,K] @ svd_down[K,r]
+    PL_START();
     CUBLAS_CHECK(cublasGemmEx(cublas(),
         CUBLAS_OP_N, CUBLAS_OP_N,
         r, M, K, &alpha,
@@ -3510,105 +3891,20 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
         &beta0,
         (float*)out.data, CUDA_R_32F, N,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    PL_END(prof_lora);
 
-    // 4. Residual path — two modes:
-    //   W4A4 (nunchaku_swizzle): quantize activations to INT4, INT4×INT4 GEMM
-    //   W4A16 (default): dequant weights to BF16, BF16×BF16 GEMM
-    if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data && !getenv("FORCE_W4A16")) {
-        static int w4a4_count = 0;
-        if (w4a4_count < 2) {
-            fprintf(stderr, "  [W4A4 path] M=%d K=%d N=%d r=%d gs=%d smooth=%d\n",
-                    M, K, N, r, weight.group_size, has_smooth ? 1 : 0);
-            w4a4_count++;
-        }
-        // W4A4 path: fp32_tmp already has smooth-divided activations from step 1
-        // (fp32_tmp was used for smooth_div → bf16 conversion; recompute smooth here)
-        if (has_smooth) {
-            apply_smooth_div((const float*)x.data, (const float*)weight.smooth.data, fp32_tmp, M, K);
-        } else {
-            CUDA_CHECK(cudaMemcpy(fp32_tmp, x.data, (int64_t)M * K * sizeof(float),
-                                   cudaMemcpyDeviceToDevice));
-        }
-
-        // Reuse region A (deq_w area, N*K*2 bytes) for act_packed and act_scales
-        // act_packed: [M, K/2] bytes, act_scales: [num_groups, M] * 4 bytes
-        int num_groups = K / weight.group_size;
-        uint8_t* act_packed = (uint8_t*)deq_w;
-        float* act_scales_ptr = (float*)((char*)act_packed + (((int64_t)M * (K / 2) + 255) & ~255LL));
-
-        quantize_activation_int4(fp32_tmp, act_packed, act_scales_ptr, M, K, weight.group_size);
-
-        // W4A4 GEMM → write to fp32_tmp (reuse as [M, N] output buffer)
-        // fp32_tmp is [M, K] = M*K*4 bytes, and we need [M, N] = M*N*4 bytes
-        // For nunchaku layers K >= N typically, so this fits.
-        // But to be safe, use a separate region. Region after act_scales:
-        float* w4a4_out = (float*)((char*)act_scales_ptr + (((int64_t)num_groups * M * 4 + 255) & ~255LL));
-
+    // 4. Residual path
+    PL_START();
+    if (use_w4a4) {
+        // W4A4 GEMM with accumulate=true: adds result directly to out (which has LoRA output)
         w4a4_gemm(act_packed, (uint8_t*)weight.qweight_rowmajor.data,
                   act_scales_ptr, (float*)weight.wscales_rowmajor.data,
-                  w4a4_out, M, N, K, weight.group_size);
-
-        // Debug: verify W4A4 GEMM output against dequant+FP32 reference for one element
-        static int w4a4_check_count = 0;
-        if (getenv("VERIFY_W4A4") && w4a4_check_count < 3) {
-            w4a4_check_count++;
-            CUDA_CHECK(cudaDeviceSynchronize());
-            // Download small amounts of data to CPU for verification
-            int check_m = 0, check_n = 0;
-            // Dequantize weight[check_n, :] and activation[check_m, :], compute dot product
-            std::vector<uint8_t> wgt_row(K / 2);
-            CUDA_CHECK(cudaMemcpy(wgt_row.data(), (uint8_t*)weight.qweight_rowmajor.data + (int64_t)check_n * (K/2),
-                                   K / 2, cudaMemcpyDeviceToHost));
-            std::vector<float> wgt_scales_cpu(num_groups);
-            for (int g = 0; g < num_groups; g++) {
-                float s;
-                CUDA_CHECK(cudaMemcpy(&s, (float*)weight.wscales_rowmajor.data + g * N + check_n,
-                                       sizeof(float), cudaMemcpyDeviceToHost));
-                wgt_scales_cpu[g] = s;
-            }
-            std::vector<float> act_cpu(K);
-            CUDA_CHECK(cudaMemcpy(act_cpu.data(), fp32_tmp + (int64_t)check_m * K,
-                                   K * sizeof(float), cudaMemcpyDeviceToHost));
-
-            // Reference FP32 computation: dequant weights and dot product
-            double ref_dot = 0;
-            int gs = weight.group_size;
-            for (int g = 0; g < num_groups; g++) {
-                float ws = wgt_scales_cpu[g];
-                for (int k = 0; k < gs; k++) {
-                    int col = g * gs + k;
-                    int byte_idx = col / 2;
-                    int nibble = (col % 2 == 0) ? (wgt_row[byte_idx] & 0xF) : ((wgt_row[byte_idx] >> 4) & 0xF);
-                    int w_int = (nibble >= 8) ? (nibble - 16) : nibble;
-                    float w_deq = (float)w_int * ws;
-                    ref_dot += (double)act_cpu[col] * w_deq;
-                }
-            }
-
-            // W4A4 GEMM output for (check_m, check_n)
-            float w4a4_val;
-            CUDA_CHECK(cudaMemcpy(&w4a4_val, w4a4_out + (int64_t)check_m * N + check_n,
-                                   sizeof(float), cudaMemcpyDeviceToHost));
-
-            // LoRA output for (check_m, check_n)
-            float lora_val;
-            CUDA_CHECK(cudaMemcpy(&lora_val, (float*)out.data + (int64_t)check_m * N + check_n,
-                                   sizeof(float), cudaMemcpyDeviceToHost));
-
-            fprintf(stderr, "  W4A4 VERIFY [%d] M=%d K=%d N=%d gs=%d: "
-                    "w4a4[0,0]=%.6f ref_deq=%.6f lora[0,0]=%.6f sum=%.6f\n",
-                    w4a4_check_count, M, K, N, gs,
-                    w4a4_val, (float)ref_dot, lora_val, w4a4_val + lora_val);
-            // Also print weight scale stats
-            double ws_sum = 0, ws_max = 0;
-            for (int g = 0; g < num_groups; g++) { ws_sum += wgt_scales_cpu[g]; ws_max = std::max(ws_max, (double)wgt_scales_cpu[g]); }
-            fprintf(stderr, "    wscales: mean=%.6f max=%.6f  act[0:5]=%.4f %.4f %.4f %.4f %.4f\n",
-                    ws_sum / num_groups, ws_max, act_cpu[0], act_cpu[1], act_cpu[2], act_cpu[3], act_cpu[4]);
-        }
-
-        // Accumulate: out += w4a4_out
-        add_fp32((float*)out.data, w4a4_out, (float*)out.data, (int64_t)M * N);
+                  (float*)out.data, M, N, K, weight.group_size,
+                  weight.qweight_mma.data ? (const uint32_t*)weight.qweight_mma.data : nullptr,
+                  true);  // accumulate into LoRA output
+        PL_END(prof_w4a4);
     } else if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data) {
+        PL_END(prof_w4a4); // end timing for non-W4A4 paths (counts as residual)
         // W4A16 fallback for nunchaku (FORCE_W4A16): dequant unswizzled → BF16 GEMM
         static int w4a16_fb = 0;
         if (w4a16_fb < 2) { fprintf(stderr, "  [W4A16-nunchaku fallback] M=%d K=%d N=%d\n", M, K, N); w4a16_fb++; }
@@ -3672,6 +3968,21 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
             &beta1,
             (float*)out.data, CUDA_R_32F, N,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        PL_END(prof_w4a4);
+    }
+
+    if (profile_linear) {
+        prof_count++;
+        // Print every 720 calls (one full step)
+        if (prof_count % 1440 == 0) {
+            float total = prof_prep + prof_lora + prof_w4a4;
+            fprintf(stderr, "\n=== Linear INT4 Profile (%d calls, total %.1f ms) ===\n", prof_count, total);
+            fprintf(stderr, "  prep (fused/smooth+bf16): %7.1f ms  (%4.1f%%)\n", prof_prep, 100*prof_prep/total);
+            fprintf(stderr, "  lora (svd_down+svd_up):   %7.1f ms  (%4.1f%%)\n", prof_lora, 100*prof_lora/total);
+            fprintf(stderr, "  w4a4 (GEMM+accumulate):   %7.1f ms  (%4.1f%%)\n", prof_w4a4, 100*prof_w4a4/total);
+            fprintf(stderr, "=============================================\n\n");
+            prof_prep = prof_lora = prof_w4a4 = 0;
+        }
     }
 
     // 8. Add bias

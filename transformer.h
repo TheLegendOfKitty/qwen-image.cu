@@ -261,6 +261,18 @@ struct TransformerWeights {
             qw.qweight.free_data();
             qw.wscales_bf16.free_data();
 
+            // Create MMA fragment-ordered weights for register-direct GEMM
+            {
+                int N_tiles8 = (N + 7) / 8;
+                int64_t mma_bytes = (int64_t)num_groups * N_tiles8 * 256;
+                qw.qweight_mma = Tensor::alloc({mma_bytes}, DType::UINT8);
+                swizzle_w4a4_weights_mma(
+                    (uint8_t*)qw.qweight_rowmajor.data,
+                    (uint32_t*)qw.qweight_mma.data,
+                    N, K, qw.group_size);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+
             return qw;
         };
 
@@ -365,6 +377,18 @@ struct TransformerWeights {
                 CUDA_CHECK(cudaDeviceSynchronize());
                 qw.qweight.free_data();
                 qw.wscales_bf16.free_data();
+
+                // Create MMA fragment-ordered weights for register-direct GEMM
+                {
+                    int N_tiles8 = ((int)N + 7) / 8;
+                    int64_t mma_bytes = (int64_t)num_groups * N_tiles8 * 256;
+                    qw.qweight_mma = Tensor::alloc({mma_bytes}, DType::UINT8);
+                    swizzle_w4a4_weights_mma(
+                        (uint8_t*)qw.qweight_rowmajor.data,
+                        (uint32_t*)qw.qweight_mma.data,
+                        (int)N, (int)K, qw.group_size);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
             }
 
             fused_qw.free_data();

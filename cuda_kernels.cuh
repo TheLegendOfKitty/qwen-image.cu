@@ -210,6 +210,9 @@ struct QuantizedWeight {
     Tensor qweight_rowmajor;    // [N, K/2] UINT8 — row-major packed INT4 (two's complement nibbles)
     Tensor wscales_rowmajor;    // [num_groups, N] FP32 — row-major weight scales
 
+    // --- W4A4 MMA fragment-ordered weights for register-direct GEMM ---
+    Tensor qweight_mma;         // [num_groups * N_tiles8 * 256] UINT8 — MMA-fragment-ordered packed INT4
+
     QuantizedWeight() : had_block_size(0), group_size(128), svd_rank(0), nf4_grid(true), nunchaku_swizzle(false) {}
     QuantizedWeight(QuantizedWeight&&) = default;
     QuantizedWeight& operator=(QuantizedWeight&&) = default;
@@ -225,6 +228,7 @@ struct QuantizedWeight {
         wscales_bf16.free_data();
         qweight_rowmajor.free_data();
         wscales_rowmajor.free_data();
+        qweight_mma.free_data();
     }
 };
 
@@ -334,13 +338,27 @@ void unswizzle_lora_weights(const __nv_bfloat16* packed, __nv_bfloat16* standard
 void quantize_activation_int4(const float* x, uint8_t* act_packed, float* act_scales,
                                int M, int K, int group_size, cudaStream_t stream = 0);
 
+// Swizzle row-major INT4 weights into MMA fragment order for register-direct GEMM
+// wgt_rowmajor: [N, K/2] UINT8, wgt_mma: [num_groups * N_tiles8 * 256] bytes
+void swizzle_w4a4_weights_mma(const uint8_t* wgt_rowmajor, uint32_t* wgt_mma,
+                               int N, int K, int group_size, cudaStream_t stream = 0);
+
 // INT4×INT4 GEMM with per-group dequantization
 // act_packed: [M, K/2] UINT8, wgt_packed: [N, K/2] UINT8 (row-major)
 // act_scales: [num_groups, M] FP32, wgt_scales: [num_groups, N] FP32
 // output: [M, N] FP32
+// wgt_mma: if non-null, use register-direct kernel (MMA fragment-ordered weights)
 void w4a4_gemm(const uint8_t* act_packed, const uint8_t* wgt_packed,
                const float* act_scales, const float* wgt_scales,
-               float* output, int M, int N, int K, int group_size, cudaStream_t stream = 0);
+               float* output, int M, int N, int K, int group_size,
+               const uint32_t* wgt_mma = nullptr, bool accumulate = false,
+               cudaStream_t stream = 0);
+
+// Fused: smooth_div + fp32_to_bf16 + quantize_activation_int4 in one pass
+void fused_smooth_bf16_quant(const float* x, const float* smooth,
+                              __nv_bfloat16* bf16_out,
+                              uint8_t* act_packed, float* act_scales,
+                              int M, int K, int group_size, cudaStream_t stream = 0);
 
 // Element-wise FP32 add: out[i] = a[i] + b[i]
 void add_fp32(const float* a, const float* b, float* out, int64_t n, cudaStream_t stream = 0);

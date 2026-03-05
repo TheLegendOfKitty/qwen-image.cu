@@ -312,6 +312,17 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     // 3. Run 60 transformer blocks
     const int internal_dump_block = get_transformer_internal_dump_block();
+    static bool profile_block = (getenv("PROFILE_BLOCK") != nullptr);
+    float prof_modulation = 0, prof_attn_norm = 0, prof_qkv_gemm = 0, prof_qk_norm = 0;
+    float prof_concat_transpose = 0, prof_rope = 0, prof_attention = 0;
+    float prof_transpose_split = 0, prof_out_gemm = 0, prof_gate_attn = 0;
+    float prof_mlp_norm = 0, prof_mlp_gemm = 0, prof_gate_mlp = 0;
+    cudaEvent_t ev_start, ev_end;
+    if (profile_block) { cudaEventCreate(&ev_start); cudaEventCreate(&ev_end); }
+    #define PROF_START() do { if (profile_block) cudaEventRecord(ev_start); } while(0)
+    #define PROF_END(acc) do { if (profile_block) { cudaEventRecord(ev_end); cudaEventSynchronize(ev_end); \
+        float ms; cudaEventElapsedTime(&ms, ev_start, ev_end); acc += ms; } } while(0)
+
     for (int bi = 0; bi < 60; bi++) {
         auto& b = w.blocks[bi];
         const bool dump_internal_block = (bi == internal_dump_block);
@@ -322,6 +333,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         };
 
         // Compute modulation: silu(t_emb) -> Linear -> chunk(6) in FP32.
+        PROF_START();
         silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
         {
             linear_forward_quantized(t_emb_silu, b.img_mod_weight, &b.img_mod_bias,
@@ -329,6 +341,7 @@ Tensor transformer_forward(const TransformerWeights& w,
             linear_forward_quantized(t_emb_silu, b.txt_mod_weight, &b.txt_mod_bias,
                                 txt_mod_buf, gemm_scratch);
         }
+        PROF_END(prof_modulation);
 
         auto* img_mods = (float*)img_mod_buf.data;
         auto* txt_mods = (float*)txt_mod_buf.data;
@@ -341,6 +354,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         // === ATTENTION PATH ===
 
         // LayerNorm(FP32 residual) → FP32
+        PROF_START();
         layer_norm_no_affine_fp32((float*)img.data, (float*)img_normed_fp32.data,
                                    n_img, inner_dim, 1e-6f);
 
@@ -375,7 +389,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             CUDA_CHECK(cudaFree(cal_buf));
         }
 
+        PROF_END(prof_attn_norm);
+
         // Attention projections: FP32 activations → INT8 GEMM → FP32 output.
+        PROF_START();
         {
             Tensor oq = img_q.view({n_img, inner_dim});
             Tensor ok = img_k.view({n_img, inner_dim});
@@ -399,7 +416,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("img_v_raw.bin", img_v.data, (int64_t)n_img * inner_dim, false);
         }
 
+        PROF_END(prof_qkv_gemm);
+
         // RMSNorm on Q/K: FP32 input, BF16 weight → FP32 output
+        PROF_START();
         rms_norm_fp32((float*)img_q.data, (__nv_bfloat16*)b.norm_q_weight.data,
                       (float*)img_q.data, n_img * n_heads, head_dim, 1e-6f);
         rms_norm_fp32((float*)img_k.data, (__nv_bfloat16*)b.norm_k_weight.data,
@@ -415,7 +435,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("txt_q_normed.bin", txt_q.data, (int64_t)n_txt * inner_dim, false);
         }
 
+        PROF_END(prof_qk_norm);
+
         // Concatenate [txt, img] along sequence dim (FP32)
+        PROF_START();
         concat_seq_fp32((float*)txt_q.data, (float*)img_q.data,
                         (float*)q_cat.data, 1, n_txt, n_img, inner_dim);
         concat_seq_fp32((float*)txt_k.data, (float*)img_k.data,
@@ -441,7 +464,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("k_joint.bin", k_t.data, (int64_t)n_heads * total_seq * head_dim, false);
         }
 
+        PROF_END(prof_concat_transpose);
+
         // Apply RoPE (FP32)
+        PROF_START();
         rope_apply_fp32((float*)q_t.data, (float*)pe.data, (float*)q_t.data,
                         n_heads, total_seq, head_dim);
         rope_apply_fp32((float*)k_t.data, (float*)pe.data, (float*)k_t.data,
@@ -453,13 +479,19 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("v_joint.bin", v_t.data, (int64_t)n_heads * total_seq * head_dim, false);
         }
 
+        PROF_END(prof_rope);
+
         // Scaled dot-product attention in full FP32 to match the ggml fallback path.
+        PROF_START();
         float attn_scale = 1.0f / sqrtf(128.0f);
         attention_forward_fp32io(
             (float*)q_t.data, (float*)k_t.data, (float*)v_t.data,
             (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim);
 
+        PROF_END(prof_attention);
+
         // Transpose back [H, S, D] -> [S, H*D] (FP32)
+        PROF_START();
         {
             int64_t total_elems = (int64_t)n_heads * total_seq * head_dim;
             int block = 256;
@@ -491,7 +523,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             CUDA_CHECK(cudaFree(cal_buf));
         }
 
+        PROF_END(prof_transpose_split);
+
         // Output projections: FP32 activations → INT8 GEMM → FP32 output.
+        PROF_START();
         {
             Tensor ip_2d = img_proj.view({n_img, inner_dim});
             linear_forward_quantized(img_attn_out, b.to_out_weight, &b.to_out_bias, ip_2d, gemm_scratch);
@@ -504,11 +539,15 @@ Tensor transformer_forward(const TransformerWeights& w,
             dump_internal("img_proj.bin", img_proj.data, (int64_t)n_img * inner_dim, false);
         }
 
+        PROF_END(prof_out_gemm);
+
         // Residual: img_fp32 += gate1 * FP32_proj
+        PROF_START();
         gate_add_fp32f((float*)img.data, img_mods + 2 * inner_dim,
                         (float*)img_proj.data, (float*)img.data, n_img, inner_dim);
         gate_add_fp32f((float*)txt.data, txt_mods + 2 * inner_dim,
                         (float*)txt_proj.data, (float*)txt.data, n_txt, inner_dim);
+        PROF_END(prof_gate_attn);
 
         if (dump_internal_block) {
             dump_internal("img_after_attn.bin", img.data, (int64_t)n_img * inner_dim, false);
@@ -517,6 +556,7 @@ Tensor transformer_forward(const TransformerWeights& w,
         // === MLP PATH ===
 
         // LayerNorm(FP32) → Modulate(FP32) → FP32 GEMMs
+        PROF_START();
         layer_norm_no_affine_fp32((float*)img.data, (float*)img_normed_fp32.data,
                                    n_img, inner_dim, 1e-6f);
         modulate_fp32_f32params((float*)img_normed_fp32.data,
@@ -543,7 +583,10 @@ Tensor transformer_forward(const TransformerWeights& w,
             CUDA_CHECK(cudaFree(cal_buf));
         }
 
+        PROF_END(prof_mlp_norm);
+
         // GELU MLP (INT8 GEMMs)
+        PROF_START();
         if (dump_internal_block) dump_internal("img_mlp_input.bin", img_normed_fp32.data, (int64_t)n_img * inner_dim, false);
         {
             Tensor mlp_2d = img_mlp_fp32.view({n_img, mlp_dim});
@@ -577,11 +620,15 @@ Tensor transformer_forward(const TransformerWeights& w,
             linear_forward_quantized(txt_mlp_fp32, b.txt_mlp_fc2_weight, &b.txt_mlp_fc2_bias, out_2d, gemm_scratch);
         }
 
+        PROF_END(prof_mlp_gemm);
+
         // Residual: img_fp32 += gate2 * FP32_mlp_out
+        PROF_START();
         gate_add_fp32f((float*)img.data, img_mods + 5 * inner_dim,
                         (float*)img_mlp_out.data, (float*)img.data, n_img, inner_dim);
         gate_add_fp32f((float*)txt.data, txt_mods + 5 * inner_dim,
                         (float*)txt_mlp_out.data, (float*)txt.data, n_txt, inner_dim);
+        PROF_END(prof_gate_mlp);
 
         if (dump_internal_block) {
             dump_internal("img_after_mlp.bin", img.data, (int64_t)n_img * inner_dim, false);
@@ -599,6 +646,30 @@ Tensor transformer_forward(const TransformerWeights& w,
             snprintf(path, sizeof(path), "cuda_img_after_b%d.bin", bi);
             dump(path, img.data, (int64_t)n_img * inner_dim, false);
         }
+    }
+
+    if (profile_block) {
+        float total = prof_modulation + prof_attn_norm + prof_qkv_gemm + prof_qk_norm +
+                      prof_concat_transpose + prof_rope + prof_attention +
+                      prof_transpose_split + prof_out_gemm + prof_gate_attn +
+                      prof_mlp_norm + prof_mlp_gemm + prof_gate_mlp;
+        fprintf(stderr, "\n=== Block Loop Profile (60 blocks, total %.1f ms) ===\n", total);
+        fprintf(stderr, "  modulation:        %7.1f ms  (%4.1f%%)\n", prof_modulation, 100*prof_modulation/total);
+        fprintf(stderr, "  attn_norm:         %7.1f ms  (%4.1f%%)\n", prof_attn_norm, 100*prof_attn_norm/total);
+        fprintf(stderr, "  qkv_gemm:          %7.1f ms  (%4.1f%%)\n", prof_qkv_gemm, 100*prof_qkv_gemm/total);
+        fprintf(stderr, "  qk_norm:           %7.1f ms  (%4.1f%%)\n", prof_qk_norm, 100*prof_qk_norm/total);
+        fprintf(stderr, "  concat_transpose:  %7.1f ms  (%4.1f%%)\n", prof_concat_transpose, 100*prof_concat_transpose/total);
+        fprintf(stderr, "  rope:              %7.1f ms  (%4.1f%%)\n", prof_rope, 100*prof_rope/total);
+        fprintf(stderr, "  attention:         %7.1f ms  (%4.1f%%)\n", prof_attention, 100*prof_attention/total);
+        fprintf(stderr, "  transpose_split:   %7.1f ms  (%4.1f%%)\n", prof_transpose_split, 100*prof_transpose_split/total);
+        fprintf(stderr, "  out_gemm:          %7.1f ms  (%4.1f%%)\n", prof_out_gemm, 100*prof_out_gemm/total);
+        fprintf(stderr, "  gate_attn:         %7.1f ms  (%4.1f%%)\n", prof_gate_attn, 100*prof_gate_attn/total);
+        fprintf(stderr, "  mlp_norm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_norm, 100*prof_mlp_norm/total);
+        fprintf(stderr, "  mlp_gemm:          %7.1f ms  (%4.1f%%)\n", prof_mlp_gemm, 100*prof_mlp_gemm/total);
+        fprintf(stderr, "  gate_mlp:          %7.1f ms  (%4.1f%%)\n", prof_gate_mlp, 100*prof_gate_mlp/total);
+        fprintf(stderr, "===============================================\n\n");
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
     }
 
     dump("cuda_img_final_fp32.bin", img.data, (int64_t)n_img * inner_dim, false);
