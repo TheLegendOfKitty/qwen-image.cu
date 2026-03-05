@@ -20,6 +20,7 @@
 struct Config {
     std::string prompt = "a red rose";
     std::string model_dir = "./Qwen-Image-2512/";
+    std::string text_encoder;      // optional: single safetensors file for text encoder
     std::string quant_transformer; // optional: pre-quantized transformer safetensors file
     std::string output = "output.ppm";
     std::string calibrate; // optional: output calibration file for GPTQ
@@ -42,6 +43,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.output = argv[++i];
         } else if (arg == "--model-dir" && i + 1 < argc) {
             cfg.model_dir = argv[++i];
+        } else if (arg == "--text-encoder" && i + 1 < argc) {
+            cfg.text_encoder = argv[++i];
         } else if (arg == "--quant-transformer" && i + 1 < argc) {
             cfg.quant_transformer = argv[++i];
         } else if (arg == "--calibrate" && i + 1 < argc) {
@@ -67,6 +70,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  -p, --prompt TEXT       Prompt text\n");
             fprintf(stderr, "  -o, --output FILE       Output file (PPM or BMP)\n");
             fprintf(stderr, "  --model-dir DIR         Model directory\n");
+            fprintf(stderr, "  --text-encoder FILE     Single safetensors for text encoder\n");
             fprintf(stderr, "  --quant-transformer F   Pre-quantized transformer safetensors\n");
             fprintf(stderr, "  --calibrate FILE        Capture calibration data for GPTQ (1 step)\n");
             fprintf(stderr, "  --width N               Image width (default: 512)\n");
@@ -259,7 +263,13 @@ int main(int argc, char** argv) {
 
     // ========== Step 3: Text encoding ==========
     fprintf(stderr, "\n[3/8] Loading text encoder...\n");
-    SafeTensorsLoader te_loader = load_model_dir(cfg.model_dir + "text_encoder");
+    SafeTensorsLoader te_loader;
+    if (!cfg.text_encoder.empty()) {
+        fprintf(stderr, "  Using single file: %s\n", cfg.text_encoder.c_str());
+        te_loader.load_file(cfg.text_encoder);
+    } else {
+        te_loader = load_model_dir(cfg.model_dir + "text_encoder");
+    }
     te_loader.print_summary();
 
     TextEncoderWeights te_weights;

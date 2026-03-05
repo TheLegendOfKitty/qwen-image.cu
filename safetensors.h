@@ -233,25 +233,7 @@ public:
 inline SafeTensorsLoader load_model_dir(const std::string& dir) {
     SafeTensorsLoader loader;
 
-    // Try index file first
-    std::string index_path = dir + "/model.safetensors.index.json";
-    std::ifstream test_idx(index_path);
-    if (test_idx.good()) {
-        test_idx.close();
-        loader.load_sharded(index_path);
-        return loader;
-    }
-
-    // Try diffusion_pytorch_model.safetensors.index.json
-    index_path = dir + "/diffusion_pytorch_model.safetensors.index.json";
-    std::ifstream test_idx2(index_path);
-    if (test_idx2.good()) {
-        test_idx2.close();
-        loader.load_sharded(index_path);
-        return loader;
-    }
-
-    // Try single file
+    // Prefer single merged file over sharded
     std::string single = dir + "/model.safetensors";
     std::ifstream test_single(single);
     if (test_single.good()) {
@@ -265,6 +247,23 @@ inline SafeTensorsLoader load_model_dir(const std::string& dir) {
     if (test_single2.good()) {
         test_single2.close();
         loader.load_file(single);
+        return loader;
+    }
+
+    // Fall back to sharded index
+    std::string index_path = dir + "/model.safetensors.index.json";
+    std::ifstream test_idx(index_path);
+    if (test_idx.good()) {
+        test_idx.close();
+        loader.load_sharded(index_path);
+        return loader;
+    }
+
+    index_path = dir + "/diffusion_pytorch_model.safetensors.index.json";
+    std::ifstream test_idx2(index_path);
+    if (test_idx2.good()) {
+        test_idx2.close();
+        loader.load_sharded(index_path);
         return loader;
     }
 
