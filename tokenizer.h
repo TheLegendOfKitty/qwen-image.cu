@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include "json_parser.h"
+#include "safetensors.h"
 
 class Qwen2Tokenizer {
 public:
@@ -119,6 +120,67 @@ public:
         }
         mf.close();
         fprintf(stderr, "Tokenizer: loaded %zu merges\n", merges.size());
+    }
+
+    // Load vocab and merges from embedded U8 tensors in a SafeTensorsLoader
+    void load(const SafeTensorsLoader& loader) {
+        init_byte_encoder();
+
+        // Read vocab.json bytes
+        auto vit = loader.tensors.find("tokenizer.vocab_json");
+        if (vit == loader.tensors.end()) {
+            fprintf(stderr, "Tokenizer: no 'tokenizer.vocab_json' tensor found\n");
+            exit(1);
+        }
+        const TensorInfo& vinfo = vit->second;
+        std::string vcontent(vinfo.nbytes, '\0');
+        {
+            size_t data_start = 0;
+            for (auto& sf : loader.files)
+                if (sf.filepath == vinfo.filename) { data_start = sf.data_start; break; }
+            FILE* f = fopen(vinfo.filename.c_str(), "rb");
+            fseek(f, (long)(data_start + vinfo.data_offset), SEEK_SET);
+            fread(&vcontent[0], 1, vinfo.nbytes, f);
+            fclose(f);
+        }
+        JsonParser parser;
+        JsonValue vroot = parser.parse(vcontent);
+        for (auto& [key, val] : vroot.object_val)
+            vocab[key] = (int32_t)val.to_int();
+        fprintf(stderr, "Tokenizer: loaded %zu vocab entries (from safetensors)\n", vocab.size());
+
+        // Read merges.txt bytes
+        auto mit = loader.tensors.find("tokenizer.merges_txt");
+        if (mit == loader.tensors.end()) {
+            fprintf(stderr, "Tokenizer: no 'tokenizer.merges_txt' tensor found\n");
+            exit(1);
+        }
+        const TensorInfo& minfo = mit->second;
+        std::string mcontent(minfo.nbytes, '\0');
+        {
+            size_t data_start = 0;
+            for (auto& sf : loader.files)
+                if (sf.filepath == minfo.filename) { data_start = sf.data_start; break; }
+            FILE* f = fopen(minfo.filename.c_str(), "rb");
+            fseek(f, (long)(data_start + minfo.data_offset), SEEK_SET);
+            fread(&mcontent[0], 1, minfo.nbytes, f);
+            fclose(f);
+        }
+        std::istringstream mstream(mcontent);
+        std::string line;
+        std::getline(mstream, line); // skip header
+        int rank = 0;
+        while (std::getline(mstream, line)) {
+            if (line.empty()) continue;
+            size_t space = line.find(' ');
+            if (space == std::string::npos) continue;
+            std::string a = line.substr(0, space);
+            std::string b = line.substr(space + 1);
+            if (!b.empty() && b.back() == '\r') b.pop_back();
+            merges.push_back({a, b});
+            bpe_ranks[a + " " + b] = rank++;
+        }
+        fprintf(stderr, "Tokenizer: loaded %zu merges (from safetensors)\n", merges.size());
     }
 
     // Encode raw bytes to BPE-encoded unicode tokens

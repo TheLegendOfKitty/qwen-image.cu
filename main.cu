@@ -21,7 +21,8 @@ struct Config {
     std::string prompt = "a red rose";
     std::string model_dir = "./Qwen-Image-2512/";
     std::string text_encoder;      // optional: single safetensors file for text encoder
-    std::string quant_transformer; // optional: pre-quantized transformer safetensors file
+    std::string transformer;       // optional: single safetensors file for transformer
+    std::string vae;               // optional: single safetensors file for VAE
     std::string output = "output.ppm";
     std::string calibrate; // optional: output calibration file for GPTQ
     int width = 512;
@@ -45,8 +46,10 @@ static Config parse_args(int argc, char** argv) {
             cfg.model_dir = argv[++i];
         } else if (arg == "--text-encoder" && i + 1 < argc) {
             cfg.text_encoder = argv[++i];
-        } else if (arg == "--quant-transformer" && i + 1 < argc) {
-            cfg.quant_transformer = argv[++i];
+        } else if ((arg == "--transformer" || arg == "--quant-transformer") && i + 1 < argc) {
+            cfg.transformer = argv[++i];
+        } else if (arg == "--vae" && i + 1 < argc) {
+            cfg.vae = argv[++i];
         } else if (arg == "--calibrate" && i + 1 < argc) {
             cfg.calibrate = argv[++i];
         } else if (arg == "--width" && i + 1 < argc) {
@@ -71,7 +74,8 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  -o, --output FILE       Output file (PPM or BMP)\n");
             fprintf(stderr, "  --model-dir DIR         Model directory\n");
             fprintf(stderr, "  --text-encoder FILE     Single safetensors for text encoder\n");
-            fprintf(stderr, "  --quant-transformer F   Pre-quantized transformer safetensors\n");
+            fprintf(stderr, "  --transformer FILE      Single safetensors for transformer\n");
+            fprintf(stderr, "  --vae FILE              Single safetensors for VAE\n");
             fprintf(stderr, "  --calibrate FILE        Capture calibration data for GPTQ (1 step)\n");
             fprintf(stderr, "  --width N               Image width (default: 512)\n");
             fprintf(stderr, "  --height N              Image height (default: 512)\n");
@@ -243,14 +247,29 @@ int main(int argc, char** argv) {
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    // ========== Step 1: Load tokenizer ==========
-    fprintf(stderr, "\n[1/8] Loading tokenizer...\n");
-    Qwen2Tokenizer tokenizer;
-    tokenizer.load(cfg.model_dir + "tokenizer/vocab.json",
-                   cfg.model_dir + "tokenizer/merges.txt");
+    // ========== Step 1: Load text encoder file(s) ==========
+    fprintf(stderr, "\n[1/8] Loading text encoder...\n");
+    SafeTensorsLoader te_loader;
+    if (!cfg.text_encoder.empty()) {
+        fprintf(stderr, "  Using single file: %s\n", cfg.text_encoder.c_str());
+        te_loader.load_file(cfg.text_encoder);
+    } else {
+        te_loader = load_model_dir(cfg.model_dir + "text_encoder");
+    }
+    te_loader.print_summary();
 
-    // ========== Step 2: Tokenize prompts ==========
-    fprintf(stderr, "\n[2/8] Tokenizing...\n");
+    // ========== Step 2: Load tokenizer ==========
+    fprintf(stderr, "\n[2/8] Loading tokenizer...\n");
+    Qwen2Tokenizer tokenizer;
+    if (te_loader.has_tensor("tokenizer.vocab_json")) {
+        tokenizer.load(te_loader);
+    } else {
+        tokenizer.load(cfg.model_dir + "tokenizer/vocab.json",
+                       cfg.model_dir + "tokenizer/merges.txt");
+    }
+
+    // ========== Step 3: Tokenize & encode ==========
+    fprintf(stderr, "\n[3/8] Tokenizing...\n");
     auto [cond_tokens, cond_strip_idx] = tokenizer.tokenize_prompt(cfg.prompt);
     auto [uncond_tokens, uncond_strip_idx] = tokenizer.tokenize_empty();
     fprintf(stderr, "  Cond tokens: %zu (strip first %d), Uncond tokens: %zu (strip first %d)\n",
@@ -260,17 +279,6 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n  Uncond IDs:");
     for (auto t : uncond_tokens) fprintf(stderr, " %d", t);
     fprintf(stderr, "\n");
-
-    // ========== Step 3: Text encoding ==========
-    fprintf(stderr, "\n[3/8] Loading text encoder...\n");
-    SafeTensorsLoader te_loader;
-    if (!cfg.text_encoder.empty()) {
-        fprintf(stderr, "  Using single file: %s\n", cfg.text_encoder.c_str());
-        te_loader.load_file(cfg.text_encoder);
-    } else {
-        te_loader = load_model_dir(cfg.model_dir + "text_encoder");
-    }
-    te_loader.print_summary();
 
     TextEncoderWeights te_weights;
     te_weights.load(te_loader);
@@ -377,16 +385,16 @@ int main(int argc, char** argv) {
     // ========== Step 4: Load transformer ==========
     fprintf(stderr, "\n[4/8] Loading transformer...\n");
     SafeTensorsLoader tf_loader;
-    if (!cfg.quant_transformer.empty()) {
-        fprintf(stderr, "  Using pre-quantized: %s\n", cfg.quant_transformer.c_str());
-        tf_loader.load_file(cfg.quant_transformer);
+    if (!cfg.transformer.empty()) {
+        fprintf(stderr, "  Using: %s\n", cfg.transformer.c_str());
+        tf_loader.load_file(cfg.transformer);
     } else {
         tf_loader = load_model_dir(cfg.model_dir + "transformer");
     }
     tf_loader.print_summary();
 
     TransformerWeights tf_weights;
-    tf_weights.load(tf_loader, cfg.model_dir);
+    tf_weights.load(tf_loader);
 
     // ========== Step 5: Compute RoPE PE ==========
     fprintf(stderr, "\n[5/8] Computing RoPE positional embeddings...\n");
@@ -662,7 +670,13 @@ int main(int argc, char** argv) {
     latent.free_data();
 
     // Load VAE
-    SafeTensorsLoader vae_loader = load_model_dir(cfg.model_dir + "vae");
+    SafeTensorsLoader vae_loader;
+    if (!cfg.vae.empty()) {
+        fprintf(stderr, "  Using: %s\n", cfg.vae.c_str());
+        vae_loader.load_file(cfg.vae);
+    } else {
+        vae_loader = load_model_dir(cfg.model_dir + "vae");
+    }
     vae_loader.print_summary();
 
     VAEDecoderWeights vae_weights;

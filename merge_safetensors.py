@@ -6,7 +6,8 @@ import struct
 import sys
 
 
-def merge_sharded_safetensors(index_path, output_path):
+def merge_sharded_safetensors(index_path, output_path, extra_files=None):
+    """Merge sharded safetensors into one. extra_files: dict of {tensor_name: file_path} to embed as U8."""
     base_dir = os.path.dirname(index_path)
     with open(index_path, 'r') as f:
         index = json.load(f)
@@ -62,6 +63,20 @@ def merge_sharded_safetensors(index_path, output_path):
             copy_plan.append((shard_path, data_start + src_start, size))
             current_offset += size
 
+    # Append extra files as U8 tensors
+    extra_data = {}
+    if extra_files:
+        for tensor_name, file_path in extra_files.items():
+            data = open(file_path, 'rb').read()
+            out_header[tensor_name] = {
+                'dtype': 'U8',
+                'shape': [len(data)],
+                'data_offsets': [current_offset, current_offset + len(data)]
+            }
+            extra_data[tensor_name] = data
+            current_offset += len(data)
+            print(f"  Embedding {file_path} as '{tensor_name}' ({len(data)} bytes)")
+
     # Write output
     header_json = json.dumps(out_header, separators=(',', ':')).encode('utf-8')
 
@@ -81,12 +96,24 @@ def merge_sharded_safetensors(index_path, output_path):
             if (i + 1) % 50 == 0 or i == total - 1:
                 print(f"  {i+1}/{total} tensors written")
 
+        for tensor_name, data in extra_data.items():
+            out.write(data)
+
     final_size = 8 + len(header_json) + current_offset
     print(f"Done: {final_size / 1e9:.2f} GB")
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: merge_safetensors.py <index.json> <output.safetensors>")
+        print("Usage: merge_safetensors.py <index.json> <output.safetensors> [--embed name=file ...]")
         sys.exit(1)
-    merge_sharded_safetensors(sys.argv[1], sys.argv[2])
+    index_path = sys.argv[1]
+    output_path = sys.argv[2]
+    extra = {}
+    for arg in sys.argv[3:]:
+        if arg.startswith('--embed'):
+            continue
+        if '=' in arg:
+            name, path = arg.split('=', 1)
+            extra[name] = path
+    merge_sharded_safetensors(index_path, output_path, extra if extra else None)
