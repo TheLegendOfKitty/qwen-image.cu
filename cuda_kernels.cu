@@ -657,9 +657,8 @@ void softmax(const float* x, float* out, int rows, int cols, cudaStream_t stream
     softmax_kernel<<<rows, threads, 0, stream>>>(x, out, rows, cols);
 }
 
-// Fused softmax → FP16 output using 2-pass online softmax
-// Pass 1: compute max and sum simultaneously (online algorithm)
-// Pass 2: compute exp(x-max)/sum and write as FP16
+// 3-pass softmax with direct FP16 output (same as softmax_kernel but outputs __half)
+// Saves a separate fp32_to_fp16 conversion pass
 __global__ void softmax_fp16out_kernel(const float* __restrict__ x,
                                         __half* __restrict__ out,
                                         int rows, int cols) {
@@ -667,61 +666,49 @@ __global__ void softmax_fp16out_kernel(const float* __restrict__ x,
     const float* x_row = x + (int64_t)row * cols;
     __half* o_row = out + (int64_t)row * cols;
 
-    // Online softmax: track running max and running sum
-    float max_val = -FLT_MAX;
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float v = x_row[i];
-        if (v > max_val) {
-            sum = sum * expf(max_val - v) + expf(0.0f);  // correct previous sum + add 1
-            max_val = v;
-        } else {
-            sum += expf(v - max_val);
-        }
-    }
-
-    // Warp reduce max (keeping sums corrected)
-    __shared__ float s_max[32], s_sum[32];
+    __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int warp = threadIdx.x / 32;
 
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
-        float other_sum = __shfl_down_sync(0xffffffff, sum, offset);
-        if (other_max > max_val) {
-            sum = sum * expf(max_val - other_max) + other_sum;
-            max_val = other_max;
-        } else {
-            sum += other_sum * expf(other_max - max_val);
-        }
-    }
+    // Pass 1: Find max
+    float max_val = -FLT_MAX;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        max_val = fmaxf(max_val, x_row[i]);
 
-    if (lane == 0) { s_max[warp] = max_val; s_sum[warp] = sum; }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    if (lane == 0) shared[warp] = max_val;
     __syncthreads();
-
-    // Final reduce across warps in warp 0
-    int num_warps = blockDim.x / 32;
     if (warp == 0) {
-        max_val = (lane < num_warps) ? s_max[lane] : -FLT_MAX;
-        sum = (lane < num_warps) ? s_sum[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            float other_max = __shfl_down_sync(0xffffffff, max_val, offset);
-            float other_sum = __shfl_down_sync(0xffffffff, sum, offset);
-            if (other_max > max_val) {
-                sum = sum * expf(max_val - other_max) + other_sum;
-                max_val = other_max;
-            } else {
-                sum += other_sum * expf(other_max - max_val);
-            }
-        }
-        if (lane == 0) { s_max[0] = max_val; s_sum[0] = sum; }
+        max_val = (lane < (blockDim.x + 31) / 32) ? shared[lane] : -FLT_MAX;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
     }
     __syncthreads();
+    if (threadIdx.x == 0) shared[0] = max_val;
+    __syncthreads();
+    max_val = shared[0];
 
-    max_val = s_max[0];
-    float inv_sum = 1.0f / s_sum[0];
+    // Pass 2: Compute exp and sum
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sum += expf(x_row[i] - max_val);
 
-    // Pass 2: compute normalized softmax and write as FP16
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) shared[0] = sum;
+    __syncthreads();
+    float inv_sum = 1.0f / shared[0];
+
+    // Pass 3: Normalize and write as FP16
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         o_row[i] = __float2half(expf(x_row[i] - max_val) * inv_sum);
 }
