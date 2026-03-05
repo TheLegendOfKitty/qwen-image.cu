@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -71,7 +73,7 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "-h" || arg == "--help") {
             fprintf(stderr, "Usage: %s [options]\n", argv[0]);
             fprintf(stderr, "  -p, --prompt TEXT       Prompt text\n");
-            fprintf(stderr, "  -o, --output FILE       Output file (PPM or BMP)\n");
+            fprintf(stderr, "  -o, --output FILE       Output file (PPM, BMP, or PNG)\n");
             fprintf(stderr, "  --model-dir DIR         Model directory\n");
             fprintf(stderr, "  --text-encoder FILE     Single safetensors for text encoder\n");
             fprintf(stderr, "  --transformer FILE      Single safetensors for transformer\n");
@@ -90,6 +92,18 @@ static Config parse_args(int argc, char** argv) {
     if (!cfg.model_dir.empty() && cfg.model_dir.back() != '/')
         cfg.model_dir += '/';
     return cfg;
+}
+
+static bool has_suffix_ci(const std::string& s, const char* suffix) {
+    size_t n = strlen(suffix);
+    if (s.size() < n) return false;
+    size_t off = s.size() - n;
+    for (size_t i = 0; i < n; i++) {
+        if (std::tolower((unsigned char)s[off + i]) != std::tolower((unsigned char)suffix[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Latent normalization constants from VAE config
@@ -709,8 +723,10 @@ int main(int argc, char** argv) {
 
     // Write file
     bool ok;
-    if (cfg.output.size() >= 4 && cfg.output.substr(cfg.output.size() - 4) == ".bmp") {
+    if (has_suffix_ci(cfg.output, ".bmp")) {
         ok = write_bmp(cfg.output, pixels.data(), out_W, out_H);
+    } else if (has_suffix_ci(cfg.output, ".png")) {
+        ok = write_png(cfg.output, pixels.data(), out_W, out_H);
     } else {
         ok = write_ppm(cfg.output, pixels.data(), out_W, out_H);
     }

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <png.h>
 
 // Write PPM image (no external dependencies)
 inline bool write_ppm(const std::string& filepath, const uint8_t* pixels, int width, int height) {
@@ -51,6 +52,54 @@ inline bool write_bmp(const std::string& filepath, const uint8_t* pixels, int wi
         fwrite(row.data(), 1, row_size, f);
     }
 
+    fclose(f);
+    return true;
+}
+
+// PNG writer using libpng
+inline bool write_png(const std::string& filepath, const uint8_t* pixels, int width, int height) {
+    FILE* f = fopen(filepath.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s for writing\n", filepath.c_str());
+        return false;
+    }
+
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png_ptr) {
+        fprintf(stderr, "Failed to create PNG write struct\n");
+        fclose(f);
+        return false;
+    }
+
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        fprintf(stderr, "Failed to create PNG info struct\n");
+        png_destroy_write_struct(&png_ptr, nullptr);
+        fclose(f);
+        return false;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        fprintf(stderr, "libpng failed while writing %s\n", filepath.c_str());
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        fclose(f);
+        return false;
+    }
+
+    png_init_io(png_ptr, f);
+    png_set_IHDR(
+        png_ptr, info_ptr, width, height,
+        8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    for (int y = 0; y < height; y++) {
+        png_bytep row = (png_bytep)(pixels + (size_t)y * width * 3);
+        png_write_row(png_ptr, row);
+    }
+
+    png_write_end(png_ptr, nullptr);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
     fclose(f);
     return true;
 }
