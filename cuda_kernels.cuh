@@ -532,6 +532,12 @@ void attention_forward_fp32(const float* q, const float* k, const float* v,
                             float* out, float scale, int BH, int S, int D,
                             bool causal = false, cudaStream_t stream = 0);
 
+// SageAttention SM80 path: FP16 Q/K/V input -> FP32 output.
+// Uses the upstream SM80 qk_int8_sv_f16_accum_f32 kernel with matching per-thread Q/K quantization.
+void attention_forward_sage_sm80_fp16io(const __half* q, const __half* k, const __half* v,
+                                        float* out, float scale, int BH, int S, int D,
+                                        bool causal = false, cudaStream_t stream = 0);
+
 // Gate add: FP32 input + BF16 gate × FP32 x → FP32 output
 void gate_add_fp32v2(const float* input, const __nv_bfloat16* gate, const float* x,
                      float* out, int rows, int dim, cudaStream_t stream = 0);

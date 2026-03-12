@@ -10,7 +10,7 @@ LIBS = -lcublas $(PNG_LIBS)
 INCLUDES = -I. $(PNG_CFLAGS)
 FLAGS = -O2 -std=c++17 --expt-relaxed-constexpr --extended-lambda -diag-suppress=177 --use_fast_math
 
-SRCS = main.cu cuda_kernels.cu text_encoder.cu transformer.cu vae_decoder.cu
+SRCS = main.cu cuda_kernels.cu text_encoder.cu transformer.cu vae_decoder.cu sageattention_sm80.cu
 TARGET = qwen-image
 
 $(TARGET): $(SRCS) $(wildcard *.h *.cuh)

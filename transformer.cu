@@ -238,6 +238,7 @@ Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& pe,
                            int H, int W,
                            CalibrationWriter* cal,
+                           bool use_sage_attention,
                            float* spectrum_hidden_out) {
     const int inner_dim = 3072; // 24 * 128
     const int n_heads = 24;
@@ -672,13 +673,20 @@ Tensor transformer_forward(const TransformerWeights& w,
 
         PROF_END(prof_rope);
 
-        // Scaled dot-product attention in full FP32 to match the ggml fallback path.
+        // Scaled dot-product attention.
         PROF_START();
         float attn_scale = 1.0f / sqrtf(128.0f);
-        attention_forward_fp32io(
-            (float*)q_t.data, (float*)k_t.data, (float*)v_t.data,
-            (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim,
-            false, 0, q_t_fp16, k_t_fp16, v_t_fp16);
+        if (use_sage_attention) {
+            attention_forward_sage_sm80_fp16io(
+                q_t_fp16, k_t_fp16, v_t_fp16,
+                (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim,
+                false, 0);
+        } else {
+            attention_forward_fp32io(
+                (float*)q_t.data, (float*)k_t.data, (float*)v_t.data,
+                (float*)attn_out_t.data, attn_scale, n_heads, total_seq, head_dim,
+                false, 0, q_t_fp16, k_t_fp16, v_t_fp16);
+        }
 
         PROF_END(prof_attention);
 

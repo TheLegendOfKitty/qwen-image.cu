@@ -36,6 +36,7 @@ struct Config {
     float flow_shift = 0.0f; // 0 = dynamic shifting (diffusers default); >0 = fixed shift (3.0 for sd.cpp)
     bool legacy_cfg = false; // true = plain CFG (sd.cpp); false = norm-preserving CFG (diffusers)
     bool verbose = false;
+    bool sage_attention = false;
     
     // Spectrum acceleration (CVPR 2026)
     bool spectrum_enabled = false;
@@ -83,6 +84,8 @@ static Config parse_args(int argc, char** argv) {
             cfg.flow_shift = atof(argv[++i]);
         } else if (arg == "-v" || arg == "--verbose") {
             cfg.verbose = true;
+        } else if (arg == "--sage-attention") {
+            cfg.sage_attention = true;
         } else if (arg == "--spectrum") {
             cfg.spectrum_enabled = true;
         } else if (arg == "--spectrum-warmup" && i + 1 < argc) {
@@ -113,6 +116,7 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  --seed N                Random seed (default: 42)\n");
             fprintf(stderr, "  --flow-shift F          Fixed flow shift (0=dynamic, 3.0=sd.cpp)\n");
             fprintf(stderr, "  -v, --verbose           Enable detailed logs\n");
+            fprintf(stderr, "  --sage-attention        Use the decoupled SageAttention SM80 backend\n");
             fprintf(stderr, "\nSpectrum acceleration (CVPR 2026):\n");
             fprintf(stderr, "  --spectrum              Enable Spectrum acceleration\n");
             fprintf(stderr, "  --spectrum-warmup N     Warmup steps before caching (default: 5)\n");
@@ -755,6 +759,7 @@ int main(int argc, char** argv) {
 
             // Run transformer for conditional (with Spectrum hidden state capture)
             denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w, cal_ptr,
+                                                cfg.sage_attention,
                                                 cfg.spectrum_enabled ? d_spectrum_hidden_cond : nullptr);
 
             // Deactivate transformer dump after cond pass
@@ -764,6 +769,7 @@ int main(int argc, char** argv) {
 
             // Run transformer for unconditional with its own Spectrum hidden-state capture.
             denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w, cal_ptr,
+                                                  cfg.sage_attention,
                                                   cfg.spectrum_enabled ? d_spectrum_hidden_uncond : nullptr);
 
             int64_t n = denoised_cond.numel();
