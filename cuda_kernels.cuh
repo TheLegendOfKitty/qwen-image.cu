@@ -537,3 +537,88 @@ void gate_add_fp32v2(const float* input, const __nv_bfloat16* gate, const float*
                      float* out, int rows, int dim, cudaStream_t stream = 0);
 void gate_add_fp32f(const float* input, const float* gate, const float* x,
                     float* out, int rows, int dim, cudaStream_t stream = 0);
+
+// ================================================================
+// SPECTRUM: Adaptive Spectral Feature Forecasting for Diffusion Acceleration
+// Chebyshev polynomial-based feature forecasting with Taylor blending
+// Reference: https://github.com/hanjq17/Spectrum (CVPR 2026)
+// ================================================================
+
+struct SpectrumConfig {
+    bool enabled = false;           // Enable Spectrum acceleration
+    int warmup_steps = 5;           // Number of warmup steps before caching
+    int window_size = 2;            // Initial window size N in paper
+    int max_order = 4;              // Number of Chebyshev bases (M in paper)
+    float blend_weight = 1.0f;      // w in paper: 1.0 = pure Chebyshev, 0.5 = blend with Taylor
+    float ridge_lambda = 0.1f;      // Ridge regularization strength
+    float flex_window = 0.0f;       // alpha in paper: 0.75 or 3.0 for adaptive windowing
+    int max_cached_steps = 100;     // Maximum steps to cache
+};
+
+// Spectrum state for feature forecasting
+struct SpectrumState {
+    // Feature buffer: stores last K features for fitting
+    float* feature_buffer = nullptr; // [K, F] FP32 feature history
+    float* step_buffer = nullptr;    // [K] FP32 numeric step indices
+    int buffer_size = 0;            // Current number of cached features
+    int max_buffer_size = 100;      // Maximum buffer size (matches reference K=100)
+    
+    // Chebyshev coefficients: [M+1, F] FP32
+    float* cheb_coeffs = nullptr;
+    bool coeffs_valid = false;      // Whether coefficients are fitted
+    
+    // Feature shape info
+    int feature_dim = 0;            // F: feature dimension
+    int spatial_size = 0;           // H*W: spatial size
+    int max_order = 4;              // M: Chebyshev polynomial order
+    
+    // Current step tracking
+    int current_step = 0;
+    int last_actual_step = -1;      // Last step with actual forward
+    int consecutive_cached = 0;     // Consecutive cached steps counter
+    float current_window = 2.0f;    // Current adaptive window size
+    float ridge_lambda = 0.1f;      // Ridge regularization
+    
+    // Temporary buffers for fitting
+    float* design_matrix = nullptr; // [K, M+1] FP32 Chebyshev design matrix
+    float* tau_buffer = nullptr;    // [K] FP32 normalized time in [-1, 1]
+    
+    void free_all() {
+        if (feature_buffer) { cudaFree(feature_buffer); feature_buffer = nullptr; }
+        if (step_buffer) { cudaFree(step_buffer); step_buffer = nullptr; }
+        if (cheb_coeffs) { cudaFree(cheb_coeffs); cheb_coeffs = nullptr; }
+        if (design_matrix) { cudaFree(design_matrix); design_matrix = nullptr; }
+        if (tau_buffer) { cudaFree(tau_buffer); tau_buffer = nullptr; }
+    }
+};
+
+// Initialize Spectrum state
+void spectrum_init(SpectrumState& state, int feature_dim, int spatial_size, 
+                   int max_buffer_size, int max_order, cudaStream_t stream = 0);
+
+// Update Spectrum with new feature after actual forward pass
+void spectrum_update(SpectrumState& state, const float* feature, int step, 
+                     cudaStream_t stream = 0);
+
+// Predict feature at target step using Spectrum
+void spectrum_predict(SpectrumState& state, float* output, int target_step,
+                      float blend_weight, cudaStream_t stream = 0);
+
+// Reset Spectrum state for new inference
+void spectrum_reset(SpectrumState& state, cudaStream_t stream = 0);
+
+// Check if current step should use cached prediction
+inline bool spectrum_should_cache(int step, int warmup_steps, float current_window) {
+    if (step < warmup_steps) return false;
+    int steps_since_actual = step - warmup_steps;
+    return (steps_since_actual % (int)floorf(current_window)) != 0;
+}
+
+// Update adaptive window size
+inline float spectrum_update_window(float current_window, float flex_window, 
+                                    int step, int total_steps) {
+    if (flex_window > 0.0f) {
+        return current_window + flex_window;
+    }
+    return current_window;
+}

@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,14 @@
     cublasStatus_t status = (call); \
     if (status != CUBLAS_STATUS_SUCCESS) { \
         fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)status); \
+        exit(1); \
+    } \
+} while(0)
+
+#define CUSOLVER_CHECK(call) do { \
+    cusolverStatus_t status = (call); \
+    if (status != CUSOLVER_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuSOLVER error at %s:%d: %d\n", __FILE__, __LINE__, (int)status); \
         exit(1); \
     } \
 } while(0)

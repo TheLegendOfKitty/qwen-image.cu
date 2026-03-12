@@ -609,10 +609,21 @@ struct TransformerWeights {
 // Forward pass: x: [1, C, H, W], timestep: scalar, context: [1, seq, 3584], pe: [pos, 64, 2, 2]
 // Returns: [1, out_channels, H, W]
 // If cal is non-null, captures Hadamard-rotated input activations for GPTQ calibration.
+// If spectrum_hidden_out is non-null, copies the final hidden state [n_img, 3072] FP32 to it for Spectrum caching.
 Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& x,       // [1, 64, H, W] after patchify input
                            float timestep,
                            const Tensor& context,  // [1, seq_len, 3584]
                            const Tensor& pe,       // [pos_len, 64, 2, 2] FP32
                            int H, int W,           // original latent H, W
-                           CalibrationWriter* cal = nullptr);
+                           CalibrationWriter* cal = nullptr,
+                           float* spectrum_hidden_out = nullptr);  // [n_img * 3072] FP32 output for Spectrum
+
+// Spectrum output projection: runs norm_out_linear + proj_out + unpatchify on predicted hidden state
+// hidden_fp32: [n_img, 3072] FP32 hidden state from transformer
+// timestep: scalar timestep for AdaNorm modulation
+// Returns: [1, 16, H, W] BF16 velocity output (same format as transformer_forward output)
+Tensor transformer_spectrum_output(const TransformerWeights& w,
+                                    const float* hidden_fp32,  // [n_img, 3072]
+                                    float timestep,
+                                    int H, int W);

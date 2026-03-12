@@ -36,6 +36,15 @@ struct Config {
     float flow_shift = 0.0f; // 0 = dynamic shifting (diffusers default); >0 = fixed shift (3.0 for sd.cpp)
     bool legacy_cfg = false; // true = plain CFG (sd.cpp); false = norm-preserving CFG (diffusers)
     bool verbose = false;
+    
+    // Spectrum acceleration (CVPR 2026)
+    bool spectrum_enabled = false;
+    int spectrum_warmup = 5;
+    int spectrum_window = 2;
+    int spectrum_order = 4;
+    float spectrum_blend = 1.0f;
+    float spectrum_lambda = 0.1f;
+    float spectrum_flex = 0.0f;
 };
 
 static Config parse_args(int argc, char** argv) {
@@ -74,6 +83,20 @@ static Config parse_args(int argc, char** argv) {
             cfg.flow_shift = atof(argv[++i]);
         } else if (arg == "-v" || arg == "--verbose") {
             cfg.verbose = true;
+        } else if (arg == "--spectrum") {
+            cfg.spectrum_enabled = true;
+        } else if (arg == "--spectrum-warmup" && i + 1 < argc) {
+            cfg.spectrum_warmup = atoi(argv[++i]);
+        } else if (arg == "--spectrum-window" && i + 1 < argc) {
+            cfg.spectrum_window = atoi(argv[++i]);
+        } else if (arg == "--spectrum-order" && i + 1 < argc) {
+            cfg.spectrum_order = atoi(argv[++i]);
+        } else if (arg == "--spectrum-blend" && i + 1 < argc) {
+            cfg.spectrum_blend = atof(argv[++i]);
+        } else if (arg == "--spectrum-lambda" && i + 1 < argc) {
+            cfg.spectrum_lambda = atof(argv[++i]);
+        } else if (arg == "--spectrum-flex" && i + 1 < argc) {
+            cfg.spectrum_flex = atof(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             fprintf(stderr, "Usage: %s [options]\n", argv[0]);
             fprintf(stderr, "  -p, --prompt TEXT       Prompt text\n");
@@ -90,6 +113,14 @@ static Config parse_args(int argc, char** argv) {
             fprintf(stderr, "  --seed N                Random seed (default: 42)\n");
             fprintf(stderr, "  --flow-shift F          Fixed flow shift (0=dynamic, 3.0=sd.cpp)\n");
             fprintf(stderr, "  -v, --verbose           Enable detailed logs\n");
+            fprintf(stderr, "\nSpectrum acceleration (CVPR 2026):\n");
+            fprintf(stderr, "  --spectrum              Enable Spectrum acceleration\n");
+            fprintf(stderr, "  --spectrum-warmup N     Warmup steps before caching (default: 5)\n");
+            fprintf(stderr, "  --spectrum-window N     Initial window size (default: 2)\n");
+            fprintf(stderr, "  --spectrum-order M      Chebyshev basis order (default: 4)\n");
+            fprintf(stderr, "  --spectrum-blend W      Blend weight: 1=Chebyshev, 0.5=blend (default: 1.0)\n");
+            fprintf(stderr, "  --spectrum-lambda L     Ridge regularization (default: 0.1)\n");
+            fprintf(stderr, "  --spectrum-flex A       Adaptive window factor (default: 0.0)\n");
             exit(0);
         }
     }
@@ -533,6 +564,34 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_mean, latents_mean, 16 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_std, latents_std, 16 * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Initialize Spectrum state for feature forecasting
+    SpectrumState spectrum_state_cond;
+    SpectrumState spectrum_state_uncond;
+    float* d_spectrum_hidden_cond = nullptr;
+    float* d_spectrum_hidden_uncond = nullptr;
+    if (cfg.spectrum_enabled) {
+        int feature_dim = 3072;  // Transformer feature dimension
+        int n_img = ((latent_h + 1) / 2) * ((latent_w + 1) / 2);  // Number of image tokens after patching
+        int spatial_size = n_img;  // For Spectrum, spatial dimension is number of image tokens
+        int max_buffer = 100;  // Match bundled Spectrum reference (K=100)
+        spectrum_init(spectrum_state_cond, feature_dim, spatial_size, max_buffer, cfg.spectrum_order);
+        spectrum_init(spectrum_state_uncond, feature_dim, spatial_size, max_buffer, cfg.spectrum_order);
+        spectrum_state_cond.current_window = (float)cfg.spectrum_window;
+        spectrum_state_uncond.current_window = (float)cfg.spectrum_window;
+        spectrum_state_cond.ridge_lambda = cfg.spectrum_lambda;
+        spectrum_state_uncond.ridge_lambda = cfg.spectrum_lambda;
+        
+        // Allocate buffer for hidden state: [n_img, 3072]
+        CUDA_CHECK(cudaMalloc(&d_spectrum_hidden_cond, (size_t)n_img * feature_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_spectrum_hidden_uncond, (size_t)n_img * feature_dim * sizeof(float)));
+        
+        LOGV("  Spectrum initialized: warmup=%d, window=%d, order=%d, blend=%.2f, lambda=%.3f, flex=%.2f\n",
+             cfg.spectrum_warmup, cfg.spectrum_window, cfg.spectrum_order,
+             cfg.spectrum_blend, cfg.spectrum_lambda, cfg.spectrum_flex);
+        LOGV("  Image tokens: %d, feature dim: %d, buffer bytes: %.1f MB\n",
+             n_img, feature_dim, (float)n_img * feature_dim * sizeof(float) / (1024*1024));
+    }
+
     // Calibration mode: run 1 denoising step capturing activations, then exit
     CalibrationWriter cal_writer;
     CalibrationWriter* cal_ptr = nullptr;
@@ -574,127 +633,252 @@ int main(int argc, char** argv) {
 
         auto t_step = std::chrono::high_resolution_clock::now();
 
+        // Check if we should use Spectrum cached prediction
+        // Need at least 2 actual forwards after warmup to fit Chebyshev basis
+        bool use_spectrum_cache = false;
+        if (cfg.spectrum_enabled && step >= cfg.spectrum_warmup) {
+            int steps_since_actual = step - spectrum_state_cond.last_actual_step;
+            int window_int = (int)floorf(spectrum_state_cond.current_window);
+            // Need at least 2 samples in buffer for prediction
+            bool has_min_samples = spectrum_state_cond.buffer_size >= 2 &&
+                                   spectrum_state_uncond.buffer_size >= 2;
+            use_spectrum_cache = has_min_samples && (steps_since_actual % window_int) != 0;
+            LOGV("    Spectrum check: step=%d, last_actual=%d, since_actual=%d, window=%d, buffer=%d, cache=%d\n",
+                 step, spectrum_state_cond.last_actual_step, steps_since_actual, window_int,
+                 spectrum_state_cond.buffer_size, use_spectrum_cache ? 1 : 0);
+        }
+
         // Convert FP32 latent to BF16 for transformer
         fp32_to_bf16((float*)latent.data, (__nv_bfloat16*)latent_bf16.data, latent_numel);
 
-        // Activate transformer dump for step 0 cond pass
-        if (step == 0 && getenv("DUMP_TRANSFORMER")) {
-            setenv("DUMP_TRANSFORMER_ACTIVE", "1", 1);
-            setenv("DUMP_TRANSFORMER_ACTIVE_STEP", "0", 1);
-        }
+        Tensor velocity_fp32;
 
-        // Run transformer for conditional
-        denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w, cal_ptr);
+        if (use_spectrum_cache) {
+            // Use Spectrum predicted hidden states for both CFG branches.
+            LOGV("    [Spectrum cache] step %d\n", step);
 
-        // Deactivate transformer dump after cond pass
-        if (step == 0 && getenv("DUMP_TRANSFORMER")) {
-            unsetenv("DUMP_TRANSFORMER_ACTIVE");
-        }
+            // Predict transformer hidden state using Spectrum
+            int F = spectrum_state_cond.feature_dim * spectrum_state_cond.spatial_size;
+            float* d_predicted_hidden_cond;
+            float* d_predicted_hidden_uncond;
+            CUDA_CHECK(cudaMalloc(&d_predicted_hidden_cond, F * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_predicted_hidden_uncond, F * sizeof(float)));
 
-        // Run transformer for unconditional
-        denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w, cal_ptr);
+            spectrum_predict(spectrum_state_cond, d_predicted_hidden_cond, step, cfg.spectrum_blend);
+            spectrum_predict(spectrum_state_uncond, d_predicted_hidden_uncond, step, cfg.spectrum_blend);
 
-        int64_t n = denoised_cond.numel();
-        // Dump raw cond/uncond outputs for comparison
-        if (step == 0 && getenv("DUMP_PIPELINE")) {
-            auto dump_gpu_f32 = [](const char* path, const void* data, int64_t n) {
-                std::vector<float> buf(n);
-                cudaMemcpy(buf.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
-                FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
-                double sum = 0; for(auto v : buf) sum += v;
-                fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
-                    path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
-            };
-            auto dump_gpu_bf16 = [](const char* path, const void* data, int64_t n) {
-                std::vector<__nv_bfloat16> bf(n);
-                cudaMemcpy(bf.data(), data, n * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-                std::vector<float> buf(n);
-                for(int64_t i=0;i<n;i++) buf[i]=__bfloat162float(bf[i]);
-                FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
-                double sum = 0; for(auto v : buf) sum += v;
-                fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
-                    path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
-            };
-            dump_gpu_bf16("pipe_velocity_cond.bin", denoised_cond.data, n);
-            dump_gpu_bf16("pipe_velocity_uncond.bin", denoised_uncond.data, n);
-            dump_gpu_f32("pipe_latent_fp32.bin", latent.data, n);
-        }
+            Tensor denoised_cond_cached = transformer_spectrum_output(
+                tf_weights,
+                d_predicted_hidden_cond,
+                timestep,
+                latent_h, latent_w);
+            Tensor denoised_uncond_cached = transformer_spectrum_output(
+                tf_weights,
+                d_predicted_hidden_uncond,
+                timestep,
+                latent_h, latent_w);
 
-        // CFG combine on raw model outputs (velocities) → FP32 result
-        Tensor velocity_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
-        {
-            int block = 256;
-            int grid = (int)((n + block - 1) / block);
+            int64_t n = denoised_cond_cached.numel();
+            velocity_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
 
-            if (cfg.legacy_cfg) {
-                // Plain CFG (matches sd.cpp)
-                cfg_combine_legacy_kernel<<<grid, block>>>(
-                    (__nv_bfloat16*)denoised_cond.data,
-                    (__nv_bfloat16*)denoised_uncond.data,
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+
+                if (cfg.legacy_cfg) {
+                    cfg_combine_legacy_kernel<<<grid, block>>>(
+                        (__nv_bfloat16*)denoised_cond_cached.data,
+                        (__nv_bfloat16*)denoised_uncond_cached.data,
+                        (float*)velocity_fp32.data,
+                        cfg.cfg_scale, n);
+                } else {
+                    CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, cfg_n_groups * sizeof(float)));
+                    CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, cfg_n_groups * sizeof(float)));
+
+                    cfg_combine_and_norms_kernel<<<grid, block>>>(
+                        (__nv_bfloat16*)denoised_cond_cached.data,
+                        (__nv_bfloat16*)denoised_uncond_cached.data,
+                        (float*)velocity_fp32.data,
+                        d_cond_norm_sq, d_comb_norm_sq,
+                        cfg.cfg_scale, n, latent_channels, latent_h, latent_w);
+
+                    cfg_norm_scale_kernel<<<grid, block>>>(
+                        (float*)velocity_fp32.data,
+                        d_cond_norm_sq, d_comb_norm_sq,
+                        n, latent_channels, latent_h, latent_w);
+                }
+            }
+
+            denoised_cond_cached.free_data();
+            denoised_uncond_cached.free_data();
+            CUDA_CHECK(cudaFree(d_predicted_hidden_cond));
+            CUDA_CHECK(cudaFree(d_predicted_hidden_uncond));
+            spectrum_state_cond.consecutive_cached++;
+            spectrum_state_uncond.consecutive_cached++;
+
+            // Apply denoiser scaling in FP32: denoised = x - sigma * velocity
+            Tensor denoised_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+                denoiser_scaling_fp32_kernel<<<grid, block>>>(
                     (float*)velocity_fp32.data,
-                    cfg.cfg_scale, n);
-            } else {
-                // Norm-preserving CFG (matches diffusers Qwen Image pipeline)
-                // Norms in packed format: groups = (H/2)*(W/2) patches, each has C*4 elements
-                CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, cfg_n_groups * sizeof(float)));
-                CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, cfg_n_groups * sizeof(float)));
+                    (float*)latent.data,
+                    (float*)denoised_fp32.data,
+                    sigma, n);
+            }
 
-                cfg_combine_and_norms_kernel<<<grid, block>>>(
-                    (__nv_bfloat16*)denoised_cond.data,
-                    (__nv_bfloat16*)denoised_uncond.data,
-                    (float*)velocity_fp32.data,
-                    d_cond_norm_sq, d_comb_norm_sq,
-                    cfg.cfg_scale, n, latent_channels, latent_h, latent_w);
+            // Euler step in FP32: x = x + (x - denoised) / sigma * dt
+            float dt = sigma_next - sigma;
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+                euler_step_fp32_kernel<<<grid, block>>>(
+                    (float*)latent.data,
+                    (float*)denoised_fp32.data,
+                    sigma, dt, n);
+            }
 
-                cfg_norm_scale_kernel<<<grid, block>>>(
+            denoised_fp32.free_data();
+            velocity_fp32.free_data();
+        } else {
+            // Actual transformer forward pass
+            if (cfg.spectrum_enabled && step >= cfg.spectrum_warmup) {
+                LOGV("    [Spectrum actual] step %d (window=%.2f)\n", step, spectrum_state_cond.current_window);
+            }
+            
+            // Activate transformer dump for step 0 cond pass
+            if (step == 0 && getenv("DUMP_TRANSFORMER")) {
+                setenv("DUMP_TRANSFORMER_ACTIVE", "1", 1);
+                setenv("DUMP_TRANSFORMER_ACTIVE_STEP", "0", 1);
+            }
+
+            // Run transformer for conditional (with Spectrum hidden state capture)
+            denoised_cond = transformer_forward(tf_weights, latent_bf16, timestep, cond_context, pe, latent_h, latent_w, cal_ptr,
+                                                cfg.spectrum_enabled ? d_spectrum_hidden_cond : nullptr);
+
+            // Deactivate transformer dump after cond pass
+            if (step == 0 && getenv("DUMP_TRANSFORMER")) {
+                unsetenv("DUMP_TRANSFORMER_ACTIVE");
+            }
+
+            // Run transformer for unconditional with its own Spectrum hidden-state capture.
+            denoised_uncond = transformer_forward(tf_weights, latent_bf16, timestep, uncond_context, pe_uncond, latent_h, latent_w, cal_ptr,
+                                                  cfg.spectrum_enabled ? d_spectrum_hidden_uncond : nullptr);
+
+            int64_t n = denoised_cond.numel();
+            
+            // Dump raw cond/uncond outputs for comparison
+            if (step == 0 && getenv("DUMP_PIPELINE")) {
+                auto dump_gpu_f32 = [](const char* path, const void* data, int64_t n) {
+                    std::vector<float> buf(n);
+                    cudaMemcpy(buf.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
+                    FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
+                    double sum = 0; for(auto v : buf) sum += v;
+                    fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
+                        path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
+                };
+                auto dump_gpu_bf16 = [](const char* path, const void* data, int64_t n) {
+                    std::vector<__nv_bfloat16> bf(n);
+                    cudaMemcpy(bf.data(), data, n * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+                    std::vector<float> buf(n);
+                    for(int64_t i=0;i<n;i++) buf[i]=__bfloat162float(bf[i]);
+                    FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
+                    double sum = 0; for(auto v : buf) sum += v;
+                    fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
+                        path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
+                };
+                dump_gpu_bf16("pipe_velocity_cond.bin", denoised_cond.data, n);
+                dump_gpu_bf16("pipe_velocity_uncond.bin", denoised_uncond.data, n);
+                dump_gpu_f32("pipe_latent_fp32.bin", latent.data, n);
+            }
+
+            // CFG combine on raw model outputs (velocities) → FP32 result
+            velocity_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+
+                if (cfg.legacy_cfg) {
+                    // Plain CFG (matches sd.cpp)
+                    cfg_combine_legacy_kernel<<<grid, block>>>(
+                        (__nv_bfloat16*)denoised_cond.data,
+                        (__nv_bfloat16*)denoised_uncond.data,
+                        (float*)velocity_fp32.data,
+                        cfg.cfg_scale, n);
+                } else {
+                    // Norm-preserving CFG (matches diffusers Qwen Image pipeline)
+                    CUDA_CHECK(cudaMemset(d_cond_norm_sq, 0, cfg_n_groups * sizeof(float)));
+                    CUDA_CHECK(cudaMemset(d_comb_norm_sq, 0, cfg_n_groups * sizeof(float)));
+
+                    cfg_combine_and_norms_kernel<<<grid, block>>>(
+                        (__nv_bfloat16*)denoised_cond.data,
+                        (__nv_bfloat16*)denoised_uncond.data,
+                        (float*)velocity_fp32.data,
+                        d_cond_norm_sq, d_comb_norm_sq,
+                        cfg.cfg_scale, n, latent_channels, latent_h, latent_w);
+
+                    cfg_norm_scale_kernel<<<grid, block>>>(
+                        (float*)velocity_fp32.data,
+                        d_cond_norm_sq, d_comb_norm_sq,
+                        n, latent_channels, latent_h, latent_w);
+                }
+            }
+            denoised_uncond.free_data();
+
+            // Apply denoiser scaling in FP32: denoised = x - sigma * velocity
+            Tensor denoised_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+                denoiser_scaling_fp32_kernel<<<grid, block>>>(
                     (float*)velocity_fp32.data,
-                    d_cond_norm_sq, d_comb_norm_sq,
-                    n, latent_channels, latent_h, latent_w);
+                    (float*)latent.data,
+                    (float*)denoised_fp32.data,
+                    sigma, n);
+            }
+
+            if (step == 0 && getenv("DUMP_PIPELINE")) {
+                auto dump_gpu_f32 = [](const char* path, const void* data, int64_t n) {
+                    std::vector<float> buf(n);
+                    cudaMemcpy(buf.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
+                    FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
+                    double sum = 0; for(auto v : buf) sum += v;
+                    fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
+                        path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
+                };
+                dump_gpu_f32("pipe_velocity_cfg.bin", velocity_fp32.data, n);
+                dump_gpu_f32("pipe_denoised.bin", denoised_fp32.data, n);
+            }
+
+            velocity_fp32.free_data();
+            denoised_cond.free_data();
+
+            // Euler step in FP32: x = x + (x - denoised) / sigma * dt
+            float dt = sigma_next - sigma;
+            {
+                int block = 256;
+                int grid = (int)((n + block - 1) / block);
+                euler_step_fp32_kernel<<<grid, block>>>(
+                    (float*)latent.data,
+                    (float*)denoised_fp32.data,
+                    sigma, dt, n);
+            }
+
+            denoised_fp32.free_data();
+
+            // Update Spectrum with actual transformer hidden state
+            if (cfg.spectrum_enabled) {
+                spectrum_update(spectrum_state_cond, d_spectrum_hidden_cond, step);
+                spectrum_update(spectrum_state_uncond, d_spectrum_hidden_uncond, step);
+
+                // Update adaptive window
+                if (cfg.spectrum_flex > 0.0f && step > cfg.spectrum_warmup) {
+                    spectrum_state_cond.current_window += cfg.spectrum_flex;
+                    spectrum_state_uncond.current_window += cfg.spectrum_flex;
+                }
             }
         }
-        denoised_uncond.free_data();
-
-        // Apply denoiser scaling in FP32: denoised = x - sigma * velocity
-        // velocity_fp32 holds the CFG-combined velocity, overwrite with denoised
-        Tensor denoised_fp32 = Tensor::alloc({1, (int64_t)latent_channels, (int64_t)latent_h, (int64_t)latent_w}, DType::FP32);
-        {
-            int block = 256;
-            int grid = (int)((n + block - 1) / block);
-            denoiser_scaling_fp32_kernel<<<grid, block>>>(
-                (float*)velocity_fp32.data,
-                (float*)latent.data,
-                (float*)denoised_fp32.data,
-                sigma, n);
-        }
-
-        if (step == 0 && getenv("DUMP_PIPELINE")) {
-            auto dump_gpu_f32 = [](const char* path, const void* data, int64_t n) {
-                std::vector<float> buf(n);
-                cudaMemcpy(buf.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost);
-                FILE* f = fopen(path, "wb"); fwrite(buf.data(), 4, n, f); fclose(f);
-                double sum = 0; for(auto v : buf) sum += v;
-                fprintf(stderr, "  PIPE: %s [%ld] mean=%.6f first5=%.4f %.4f %.4f %.4f %.4f\n",
-                    path, (long)n, sum/n, buf[0], buf[1], buf[2], buf[3], buf[4]);
-            };
-            dump_gpu_f32("pipe_velocity_cfg.bin", velocity_fp32.data, n);
-            dump_gpu_f32("pipe_denoised.bin", denoised_fp32.data, n);
-        }
-
-        velocity_fp32.free_data();
-        denoised_cond.free_data();
-
-        // Euler step in FP32: x = x + (x - denoised) / sigma * dt
-        float dt = sigma_next - sigma;
-        {
-            int block = 256;
-            int grid = (int)((n + block - 1) / block);
-            euler_step_fp32_kernel<<<grid, block>>>(
-                (float*)latent.data,
-                (float*)denoised_fp32.data,
-                sigma, dt, n);
-        }
-
-        denoised_fp32.free_data();
         CUDA_CHECK(cudaDeviceSynchronize());
 
         auto t_step_end = std::chrono::high_resolution_clock::now();
@@ -710,6 +894,15 @@ int main(int argc, char** argv) {
     if (d_cond_norm_sq) CUDA_CHECK(cudaFree(d_cond_norm_sq));
     if (d_comb_norm_sq) CUDA_CHECK(cudaFree(d_comb_norm_sq));
     latent_bf16.free_data();
+
+    // Free Spectrum state and hidden buffer
+    if (cfg.spectrum_enabled) {
+        spectrum_state_cond.free_all();
+        spectrum_state_uncond.free_all();
+        if (d_spectrum_hidden_cond) CUDA_CHECK(cudaFree(d_spectrum_hidden_cond));
+        if (d_spectrum_hidden_uncond) CUDA_CHECK(cudaFree(d_spectrum_hidden_uncond));
+        LOGV("  Spectrum state and buffers freed.\n");
+    }
 
     // Calibration mode: close file and exit early
     if (cal_ptr) {

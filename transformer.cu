@@ -237,7 +237,8 @@ Tensor transformer_forward(const TransformerWeights& w,
                            const Tensor& context,
                            const Tensor& pe,
                            int H, int W,
-                           CalibrationWriter* cal) {
+                           CalibrationWriter* cal,
+                           float* spectrum_hidden_out) {
     const int inner_dim = 3072; // 24 * 128
     const int n_heads = 24;
     const int head_dim = 128;
@@ -852,6 +853,15 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     dump("cuda_img_final_fp32.bin", img.data, (int64_t)n_img * inner_dim, false);
 
+    // Copy hidden state for Spectrum caching if requested
+    if (spectrum_hidden_out != nullptr) {
+        CUDA_CHECK(cudaMemcpy(spectrum_hidden_out, img.data, 
+                              (int64_t)n_img * inner_dim * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+        LOGV("  Spectrum hidden state copied: [%d, %d] = %ld floats\n", 
+             n_img, inner_dim, (int64_t)n_img * inner_dim);
+    }
+
     // 4. AdaLayerNormContinuous output
     Tensor ada_emb = ws.view(ws.ada_emb, 2 * inner_dim, DType::FP32, {1, 2 * inner_dim});
     silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
@@ -909,5 +919,102 @@ Tensor transformer_forward(const TransformerWeights& w,
 
     CUDA_CHECK(cudaDeviceSynchronize());
     LOGV("Transformer done: output %s\n", output.shape_str().c_str());
+    return output;
+}
+
+// ================================================================
+// Spectrum Output Projection
+// Runs the output layers on a predicted hidden state from Spectrum forecasting.
+// Allocates its own workspace to ensure correct sizing.
+// ================================================================
+
+Tensor transformer_spectrum_output(const TransformerWeights& w,
+                                    const float* hidden_fp32,  // [n_img, 3072]
+                                    float timestep_val,
+                                    int H, int W) {
+    const int inner_dim = 3072;
+    const int patch_size = 2;
+    const int out_channels = 16;
+
+    int H_pad = H + (patch_size - H % patch_size) % patch_size;
+    int W_pad = W + (patch_size - W % patch_size) % patch_size;
+    int h_patches = H_pad / patch_size;
+    int w_patches = W_pad / patch_size;
+    int n_img = h_patches * w_patches;
+    
+    // Allocate dedicated workspace for Spectrum output projection
+    Tensor t_emb_sin = Tensor::alloc({1, 256}, DType::FP32);
+    Tensor t_after_l1 = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor t_emb = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor t_emb_silu = Tensor::alloc({1, inner_dim}, DType::FP32);
+    Tensor ada_emb = Tensor::alloc({1, 2 * inner_dim}, DType::FP32);
+    Tensor img_normed_fp32 = Tensor::alloc({n_img, inner_dim}, DType::FP32);
+    Tensor img_proj_out_fp32 = Tensor::alloc({n_img, patch_size * patch_size * out_channels}, DType::FP32);
+    Tensor img_proj_out = Tensor::alloc({n_img, patch_size * patch_size * out_channels}, DType::BF16);
+    
+    // GEMM scratch space
+    int64_t scratch_bytes = int8_scratch_bytes(n_img, inner_dim, 2 * inner_dim);
+    scratch_bytes = std::max(scratch_bytes, int8_scratch_bytes(n_img, inner_dim, patch_size * patch_size * out_channels));
+    Tensor gemm_scratch = Tensor::alloc({(scratch_bytes + 3) / 4}, DType::FP32);
+
+    // 1. Timestep embedding
+    Tensor t_buf = Tensor::alloc({1}, DType::FP32);
+    t_buf.from_host(&timestep_val);
+    timestep_embedding_fp32((float*)t_buf.data, (float*)t_emb_sin.data, 1, 256, 10000.0f);
+    
+    // Match transformer_forward(): time_linear1 -> SiLU -> time_linear2.
+    linear_forward_quantized(t_emb_sin, w.time_linear1_weight, &w.time_linear1_bias,
+                             t_after_l1, gemm_scratch);
+    silu_fp32((float*)t_after_l1.data, (float*)t_after_l1.data, inner_dim);
+    linear_forward_quantized(t_after_l1, w.time_linear2_weight, &w.time_linear2_bias,
+                             t_emb, gemm_scratch);
+    
+    // 2. norm_out_linear: [3072] -> [6144]
+    silu_fp32((float*)t_emb.data, (float*)t_emb_silu.data, inner_dim);
+    linear_forward_quantized(t_emb_silu, w.norm_out_linear_weight, &w.norm_out_linear_bias,
+                             ada_emb, gemm_scratch);
+    auto* ada_mods = (float*)ada_emb.data;
+    
+    // 3. Copy hidden state and apply AdaLayerNormContinuous
+    CUDA_CHECK(cudaMemcpy(img_normed_fp32.data, hidden_fp32,
+                          (int64_t)n_img * inner_dim * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    
+    layer_norm_modulate_fp32((float*)img_normed_fp32.data,
+                             ada_mods + inner_dim,  // shift
+                             ada_mods + 0,          // scale
+                             (float*)img_normed_fp32.data,
+                             n_img, inner_dim, 1e-6f);
+    
+    // 4. proj_out: [n_img, 3072] -> [n_img, 64]
+    linear_forward_quantized(img_normed_fp32, w.proj_out_weight, &w.proj_out_bias,
+                             img_proj_out_fp32, gemm_scratch);
+    
+    // Convert to BF16
+    fp32_to_bf16((float*)img_proj_out_fp32.data, (__nv_bfloat16*)img_proj_out.data,
+                 (int64_t)n_img * patch_size * patch_size * out_channels);
+    
+    // 5. Unpatchify
+    Tensor output = Tensor::alloc({1, (int64_t)out_channels, H_pad, W_pad}, DType::BF16);
+    unpatchify((__nv_bfloat16*)img_proj_out.data, (__nv_bfloat16*)output.data,
+               1, out_channels, H_pad, W_pad, patch_size, patch_size);
+    
+    // 6. Crop if padded
+    if (H_pad != H || W_pad != W) {
+        Tensor cropped = Tensor::alloc({1, (int64_t)out_channels, (int64_t)H, (int64_t)W}, DType::BF16);
+        for (int c = 0; c < out_channels; c++) {
+            for (int h = 0; h < H; h++) {
+                CUDA_CHECK(cudaMemcpy(
+                    (__nv_bfloat16*)cropped.data + (int64_t)c * H * W + h * W,
+                    (__nv_bfloat16*)output.data + (int64_t)c * H_pad * W_pad + h * W_pad,
+                    W * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice));
+            }
+        }
+        output.free_data();
+        output = std::move(cropped);
+    }
+    
+    CUDA_CHECK(cudaDeviceSynchronize());
     return output;
 }

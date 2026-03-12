@@ -5717,3 +5717,476 @@ QuantizedWeight quantize_weight_tensor_int4_gptq_smooth(const Tensor& bf16_weigh
     qw.nf4_grid = true;
     return qw;
 }
+
+// ================================================================
+// SPECTRUM: Adaptive Spectral Feature Forecasting
+// ================================================================
+
+// Kernel: Compute Chebyshev polynomials T_0, T_1, ..., T_M at given tau values
+// tau: [K] in [-1, 1], design: [K, M+1]
+__global__ void chebyshev_design_kernel(float* design, const float* tau, int K, int M) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+    
+    float tk = tau[k];
+    // T_0(tau) = 1
+    design[k * (M + 1) + 0] = 1.0f;
+    if (M == 0) return;
+    
+    // T_1(tau) = tau
+    design[k * (M + 1) + 1] = tk;
+    
+    // T_m(tau) = 2 * tau * T_{m-1}(tau) - T_{m-2}(tau)
+    float T_prev2 = 1.0f;  // T_0
+    float T_prev1 = tk;    // T_1
+    for (int m = 2; m <= M; m++) {
+        float T_m = 2.0f * tk * T_prev1 - T_prev2;
+        design[k * (M + 1) + m] = T_m;
+        T_prev2 = T_prev1;
+        T_prev1 = T_m;
+    }
+}
+
+// Kernel: Normalize step indices to tau in [-1, 1]
+// Uses affine map: tau = (t - mid) * 2 / range, where mid = (t_min + t_max) / 2
+__global__ void normalize_tau_kernel(float* tau, const float* steps, int K) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+    
+    // Find min and max in buffer (simplified: use fixed range [0, 50])
+    float t_min = 0.0f;
+    float t_max = 50.0f;
+    float t = steps[k];
+    
+    if (t_max - t_min < 1e-6f) {
+        tau[k] = 0.0f;
+    } else {
+        float mid = 0.5f * (t_min + t_max);
+        float range = t_max - t_min;
+        tau[k] = (t - mid) * 2.0f / range;
+    }
+}
+
+__global__ void add_diagonal_kernel(float* matrix, float value, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        matrix[i * n + i] += value;
+    }
+}
+
+__global__ void build_chebyshev_row_kernel(float* design_row, float tau, int M) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    design_row[0] = 1.0f;
+    if (M == 0) return;
+
+    design_row[1] = tau;
+    float T_prev2 = 1.0f;
+    float T_prev1 = tau;
+    for (int m = 2; m <= M; m++) {
+        float T_m = 2.0f * tau * T_prev1 - T_prev2;
+        design_row[m] = T_m;
+        T_prev2 = T_prev1;
+        T_prev1 = T_m;
+    }
+}
+
+// Kernel: Ridge regression solve using Cholesky decomposition
+// Solves (X^T X + lambda*I) * C = X^T * H for C
+// X: [K, P], H: [K, F], C: [P, F]
+// Uses shared memory for small P x P Cholesky
+__global__ void ridge_regression_cholesky_kernel(
+    const float* X, const float* H, float* C,
+    int K, int P, int F, float lambda)
+{
+    // Each block handles one column of C (one feature dimension)
+    int f = blockIdx.x;
+    if (f >= F) return;
+    
+    extern __shared__ float shared[];
+    float* XtX = shared;                    // [P, P]
+    float* XtH = shared + P * P;            // [P]
+    
+    int tid = threadIdx.x;
+    
+    // Compute X^T X (symmetric, only upper triangle)
+    for (int i = tid; i < P * P; i += blockDim.x) {
+        int row = i / P;
+        int col = i % P;
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += X[k * P + row] * X[k * P + col];
+        }
+        XtX[i] = sum;
+    }
+    __syncthreads();
+    
+    // Add regularization to diagonal
+    if (tid < P) {
+        XtX[tid * P + tid] += lambda;
+    }
+    __syncthreads();
+    
+    // Compute X^T H for this feature
+    {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += X[k * P + tid] * H[k * F + f];
+        }
+        XtH[tid] = sum;
+    }
+    __syncthreads();
+    
+    // Cholesky decomposition: XtX = L * L^T
+    // In-place lower triangular L stored in XtX
+    for (int j = tid; j < P; j += blockDim.x) {
+        for (int i = j; i < P; i++) {
+            float sum = XtX[i * P + j];
+            for (int k = 0; k < j; k++) {
+                sum -= XtX[i * P + k] * XtX[j * P + k];
+            }
+            if (i == j) {
+                XtX[i * P + j] = sqrtf(fmaxf(sum, 1e-12f));
+            } else {
+                XtX[i * P + j] = sum / XtX[j * P + j];
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Forward substitution: L * y = XtH
+    float y[64];  // Assume P <= 64
+    if (tid < P) {
+        float sum = XtH[tid];
+        for (int k = 0; k < tid; k++) {
+            sum -= XtX[tid * P + k] * y[k];
+        }
+        y[tid] = sum / XtX[tid * P + tid];
+    }
+    __syncthreads();
+    
+    // Backward substitution: L^T * c = y
+    if (tid < P) {
+        float sum = y[P - 1 - tid];
+        for (int k = 0; k < P - 1 - tid; k++) {
+            sum -= XtX[(P - 1 - k) * P + (P - 1 - tid)] * y[P - 1 - k];
+        }
+        C[tid * F + f] = sum / XtX[(P - 1 - tid) * P + (P - 1 - tid)];
+    }
+}
+
+static void spectrum_fit_ridge_regression(
+    const float* X, const float* H, float* C,
+    int K, int P, int F, float lambda, cudaStream_t stream)
+{
+    float* XtX = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&XtX, (size_t)P * P * sizeof(float), stream));
+
+    CUBLAS_CHECK(cublasSetStream(cublas(), stream));
+
+    const float one = 1.0f;
+    const float zero = 0.0f;
+
+    // X is row-major [K, P], which is column-major [P, K] with the same memory.
+    CUBLAS_CHECK(cublasSgemm(
+        cublas(), CUBLAS_OP_N, CUBLAS_OP_T,
+        P, P, K,
+        &one,
+        X, P,
+        X, P,
+        &zero,
+        XtX, P));
+
+    add_diagonal_kernel<<<1, 32, 0, stream>>>(XtX, lambda, P);
+
+    // C is stored row-major [P, F]. The same memory is column-major [F, P].
+    // Compute (X^T H)^T directly into that layout.
+    CUBLAS_CHECK(cublasSgemm(
+        cublas(), CUBLAS_OP_N, CUBLAS_OP_T,
+        F, P, K,
+        &one,
+        H, F,
+        X, P,
+        &zero,
+        C, F));
+
+    cusolverDnHandle_t solver;
+    CUSOLVER_CHECK(cusolverDnCreate(&solver));
+    CUSOLVER_CHECK(cusolverDnSetStream(solver, stream));
+
+    int workspace_size = 0;
+    CUSOLVER_CHECK(cusolverDnSpotrf_bufferSize(
+        solver, CUBLAS_FILL_MODE_UPPER, P, XtX, P, &workspace_size));
+
+    float* workspace = nullptr;
+    int* info = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&workspace, (size_t)workspace_size * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&info, sizeof(int), stream));
+
+    CUSOLVER_CHECK(cusolverDnSpotrf(
+        solver, CUBLAS_FILL_MODE_UPPER, P, XtX, P, workspace, workspace_size, info));
+
+    int host_info = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&host_info, info, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host_info != 0) {
+        fprintf(stderr, "Spectrum ridge solve failed (info=%d)\n", host_info);
+        exit(1);
+    }
+
+    CUBLAS_CHECK(cublasStrsm(
+        cublas(), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
+        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+        F, P, &one, XtX, P, C, F));
+    CUBLAS_CHECK(cublasStrsm(
+        cublas(), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
+        CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
+        F, P, &one, XtX, P, C, F));
+
+    CUSOLVER_CHECK(cusolverDnDestroy(solver));
+    CUDA_CHECK(cudaFreeAsync(workspace, stream));
+    CUDA_CHECK(cudaFreeAsync(info, stream));
+    CUDA_CHECK(cudaFreeAsync(XtX, stream));
+}
+
+// Kernel: Predict using fitted Chebyshev coefficients
+// C: [P, F], design_row: [P], out: [F]
+__global__ void chebyshev_predict_kernel(const float* C, const float* design_row,
+                                          float* out, int P, int F) {
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= F) return;
+    
+    float sum = 0.0f;
+    for (int p = 0; p < P; p++) {
+        sum += C[p * F + f] * design_row[p];
+    }
+    out[f] = sum;
+}
+
+// Kernel: Local Taylor expansion prediction (Newton forward difference)
+// Uses discrete backward differences from last few features
+__global__ void taylor_predict_kernel(
+    const float* H, const float* steps, float* out,
+    int K, int F, int target_step, int order)
+{
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= F) return;
+    
+    if (K < 2) {
+        // Not enough history, just return last feature
+        out[f] = H[(K - 1) * F + f];
+        return;
+    }
+    
+    // Get last features
+    float h_i = H[(K - 1) * F + f];
+    float h_im1 = H[(K - 2) * F + f];
+    float t_i = steps[K - 1];
+    float t_im1 = steps[K - 2];
+    
+    // First difference
+    float dh1 = h_i - h_im1;
+    float dt_last = fmaxf(t_i - t_im1, 1e-6f);
+    
+    // Fractional step
+    float k_step = (float)(target_step - (int)t_i) / dt_last;
+    
+    // Taylor: h(t) = h_i + k * dh1 + ...
+    float pred = h_i + k_step * dh1;
+    
+    // Second order
+    if (order >= 2 && K >= 3) {
+        float h_im2 = H[(K - 3) * F + f];
+        float d2 = h_i - 2.0f * h_im1 + h_im2;  // Second difference
+        pred += 0.5f * k_step * (k_step - 1.0f) * d2;
+    }
+    
+    // Third order
+    if (order >= 3 && K >= 4) {
+        float h_im2 = H[(K - 3) * F + f];
+        float h_im3 = H[(K - 4) * F + f];
+        float d3 = h_i - 3.0f * h_im1 + 3.0f * h_im2 - h_im3;  // Third difference
+        pred += (k_step * (k_step - 1.0f) * (k_step - 2.0f) / 6.0f) * d3;
+    }
+    
+    out[f] = pred;
+}
+
+// Kernel: Blend Chebyshev and Taylor predictions
+__global__ void blend_predictions_kernel(
+    const float* cheb_pred, const float* taylor_pred, float* out,
+    float blend_weight, int F)
+{
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= F) return;
+    
+    // out = (1 - w) * taylor + w * cheb
+    out[f] = (1.0f - blend_weight) * taylor_pred[f] + blend_weight * cheb_pred[f];
+}
+
+// ================================================================
+// High-level Spectrum functions
+// ================================================================
+
+void spectrum_init(SpectrumState& state, int feature_dim, int spatial_size,
+                   int max_buffer_size, int max_order, cudaStream_t stream) {
+    state.feature_dim = feature_dim;
+    state.spatial_size = spatial_size;
+    state.max_buffer_size = max_buffer_size;
+    state.buffer_size = 0;
+    state.coeffs_valid = false;
+    state.current_step = 0;
+    state.last_actual_step = -1;
+    state.consecutive_cached = 0;
+    state.current_window = 2.0f;
+    
+    int F = feature_dim * spatial_size;
+    int P = max_order + 1;  // Number of Chebyshev bases
+    
+    // Allocate buffers
+    CUDA_CHECK(cudaMallocAsync(&state.feature_buffer, (size_t)max_buffer_size * F * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&state.step_buffer, (size_t)max_buffer_size * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&state.cheb_coeffs, (size_t)P * F * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&state.design_matrix, (size_t)max_buffer_size * P * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&state.tau_buffer, (size_t)max_buffer_size * sizeof(float), stream));
+    
+    // Initialize to zero
+    CUDA_CHECK(cudaMemsetAsync(state.feature_buffer, 0, (size_t)max_buffer_size * F * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.step_buffer, 0, (size_t)max_buffer_size * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.cheb_coeffs, 0, (size_t)P * F * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.design_matrix, 0, (size_t)max_buffer_size * P * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(state.tau_buffer, 0, (size_t)max_buffer_size * sizeof(float), stream));
+}
+
+void spectrum_reset(SpectrumState& state, cudaStream_t stream) {
+    state.buffer_size = 0;
+    state.coeffs_valid = false;
+    state.current_step = 0;
+    state.last_actual_step = -1;
+    state.consecutive_cached = 0;
+    // Don't reset current_window - it may be preserved across resets
+}
+
+void spectrum_update(SpectrumState& state, const float* feature, int step, cudaStream_t stream) {
+    int F = state.feature_dim * state.spatial_size;
+    float step_f = (float)step;
+    
+    // Add feature to buffer
+    if (state.buffer_size < state.max_buffer_size) {
+        // Append to buffer
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.step_buffer + state.buffer_size,
+            &step_f, sizeof(float), cudaMemcpyHostToDevice, stream));
+        
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.feature_buffer + (size_t)state.buffer_size * F,
+            feature, F * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        
+        state.buffer_size++;
+    } else {
+        // Shift buffer left and append new feature
+        // Use temporary buffer for the shift since cudaMemmoveAsync may not be available
+        float* temp_feature;
+        float* temp_step;
+        CUDA_CHECK(cudaMallocAsync(&temp_feature, (state.max_buffer_size - 1) * F * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&temp_step, (state.max_buffer_size - 1) * sizeof(float), stream));
+        
+        // Copy elements 1..end to temp
+        CUDA_CHECK(cudaMemcpyAsync(
+            temp_feature,
+            state.feature_buffer + F,
+            (state.max_buffer_size - 1) * F * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            temp_step,
+            state.step_buffer + 1,
+            (state.max_buffer_size - 1) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        
+        // Copy back to start
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.feature_buffer,
+            temp_feature,
+            (state.max_buffer_size - 1) * F * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.step_buffer,
+            temp_step,
+            (state.max_buffer_size - 1) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        
+        CUDA_CHECK(cudaFreeAsync(temp_feature, stream));
+        CUDA_CHECK(cudaFreeAsync(temp_step, stream));
+        
+        // Append new feature at end
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.step_buffer + state.max_buffer_size - 1,
+            &step_f, sizeof(float), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            state.feature_buffer + (size_t)(state.max_buffer_size - 1) * F,
+            feature, F * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
+    
+    state.last_actual_step = step;
+    state.consecutive_cached = 0;
+    state.coeffs_valid = false;  // Invalidate coefficients
+}
+
+
+void spectrum_predict(SpectrumState& state, float* output, int target_step,
+                      float blend_weight, cudaStream_t stream) {
+    int K = state.buffer_size;
+    int F = state.feature_dim * state.spatial_size;
+    int P = state.max_order + 1;
+
+    if (K < 2) {
+        fprintf(stderr, "Spectrum: insufficient history (K=%d) for prediction\n", K);
+        return;
+    }
+
+    int block_size = 256;
+    int grid;
+
+    // Step 1: Normalize tau values
+    grid = (K + block_size - 1) / block_size;
+    normalize_tau_kernel<<<grid, block_size, 0, stream>>>(state.tau_buffer, state.step_buffer, K);
+
+    // Step 2: Build Chebyshev design matrix [K, P]
+    chebyshev_design_kernel<<<grid, block_size, 0, stream>>>(state.design_matrix, state.tau_buffer, K, P - 1);
+
+    // Step 3: Fit Chebyshev coefficients via ridge regression
+    spectrum_fit_ridge_regression(
+        state.design_matrix, state.feature_buffer, state.cheb_coeffs,
+        K, P, F, state.ridge_lambda, stream);
+
+    state.coeffs_valid = true;
+
+    // Step 4: Build design row for target step
+    float tau_target;
+    {
+        float t_min = 0.0f, t_max = 50.0f;
+        float mid = 0.5f * (t_min + t_max);
+        float range = t_max - t_min;
+        tau_target = ((float)target_step - mid) * 2.0f / range;
+    }
+
+    float* d_design_row;
+    CUDA_CHECK(cudaMallocAsync(&d_design_row, P * sizeof(float), stream));
+    build_chebyshev_row_kernel<<<1, 1, 0, stream>>>(d_design_row, tau_target, P - 1);
+
+    // Step 5: Chebyshev prediction
+    float* d_cheb_pred;
+    CUDA_CHECK(cudaMallocAsync(&d_cheb_pred, F * sizeof(float), stream));
+    grid = (F + block_size - 1) / block_size;
+    chebyshev_predict_kernel<<<grid, block_size, 0, stream>>>(state.cheb_coeffs, d_design_row, d_cheb_pred, P, F);
+
+    // Step 6: Taylor prediction
+    float* d_taylor_pred;
+    CUDA_CHECK(cudaMallocAsync(&d_taylor_pred, F * sizeof(float), stream));
+    taylor_predict_kernel<<<grid, block_size, 0, stream>>>(
+        state.feature_buffer, state.step_buffer, d_taylor_pred, K, F, target_step, 1);
+
+    // Step 7: Blend predictions
+    blend_predictions_kernel<<<grid, block_size, 0, stream>>>(d_cheb_pred, d_taylor_pred, output, blend_weight, F);
+
+    // Cleanup
+    CUDA_CHECK(cudaFreeAsync(d_design_row, stream));
+    CUDA_CHECK(cudaFreeAsync(d_cheb_pred, stream));
+    CUDA_CHECK(cudaFreeAsync(d_taylor_pred, stream));
+}
