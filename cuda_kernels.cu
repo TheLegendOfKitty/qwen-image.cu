@@ -5749,15 +5749,13 @@ __global__ void chebyshev_design_kernel(float* design, const float* tau, int K, 
 
 // Kernel: Normalize step indices to tau in [-1, 1]
 // Uses affine map: tau = (t - mid) * 2 / range, where mid = (t_min + t_max) / 2
-__global__ void normalize_tau_kernel(float* tau, const float* steps, int K) {
+__global__ void normalize_tau_kernel(float* tau, const float* steps, int K,
+                                     float t_min, float t_max) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= K) return;
-    
-    // Find min and max in buffer (simplified: use fixed range [0, 50])
-    float t_min = 0.0f;
-    float t_max = 50.0f;
+
     float t = steps[k];
-    
+
     if (t_max - t_min < 1e-6f) {
         tau[k] = 0.0f;
     } else {
@@ -6143,9 +6141,15 @@ void spectrum_predict(SpectrumState& state, float* output, int target_step,
     int block_size = 256;
     int grid;
 
+    // Derive tau range from the step buffer (filled in order, so [0] is min, [K-1] is max)
+    float t_min, t_max;
+    CUDA_CHECK(cudaMemcpyAsync(&t_min, state.step_buffer,           sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&t_max, state.step_buffer + (K - 1), sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     // Step 1: Normalize tau values
     grid = (K + block_size - 1) / block_size;
-    normalize_tau_kernel<<<grid, block_size, 0, stream>>>(state.tau_buffer, state.step_buffer, K);
+    normalize_tau_kernel<<<grid, block_size, 0, stream>>>(state.tau_buffer, state.step_buffer, K, t_min, t_max);
 
     // Step 2: Build Chebyshev design matrix [K, P]
     chebyshev_design_kernel<<<grid, block_size, 0, stream>>>(state.design_matrix, state.tau_buffer, K, P - 1);
@@ -6160,10 +6164,9 @@ void spectrum_predict(SpectrumState& state, float* output, int target_step,
     // Step 4: Build design row for target step
     float tau_target;
     {
-        float t_min = 0.0f, t_max = 50.0f;
         float mid = 0.5f * (t_min + t_max);
         float range = t_max - t_min;
-        tau_target = ((float)target_step - mid) * 2.0f / range;
+        tau_target = (range < 1e-6f) ? 0.0f : ((float)target_step - mid) * 2.0f / range;
     }
 
     float* d_design_row;
