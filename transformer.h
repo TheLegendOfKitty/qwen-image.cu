@@ -272,6 +272,8 @@ struct TransformerWeights {
                     (uint32_t*)qw.qweight_mma.data,
                     N, K, qw.group_size);
                 CUDA_CHECK(cudaDeviceSynchronize());
+                // Free row-major weights — register-direct kernel uses qweight_mma only
+                qw.qweight_rowmajor.free_data();
             }
 
             return qw;
@@ -389,6 +391,7 @@ struct TransformerWeights {
                         (uint32_t*)qw.qweight_mma.data,
                         (int)N, (int)K, qw.group_size);
                     CUDA_CHECK(cudaDeviceSynchronize());
+                    qw.qweight_rowmajor.free_data();
                 }
             }
 
@@ -419,37 +422,40 @@ struct TransformerWeights {
         proj_out_weight = load_q("proj_out.weight");
         proj_out_bias = loader.load_tensor("proj_out.bias");
 
-        // Helper: load AWQ modulation weights from nunchaku, dequantize to BF16,
-        // de-interleave output dim, and adjust bias (remove fused +1 from scale components).
+        // Helper: load AWQ modulation weights from nunchaku, repack to transposed format
+        // for perfectly coalesced GEMV reads. Only bias is dequantized (cheap, CPU).
         auto load_awq_modulation = [&](const std::string& key_prefix,
                                         QuantizedWeight& out_weight, Tensor& out_bias) {
-            // Load raw AWQ tensors from nunchaku safetensors
-            Tensor qw_tensor = loader.load_tensor(key_prefix + ".qweight");   // [OC/4, IC/2] INT32
-            Tensor ws_tensor = loader.load_tensor(key_prefix + ".wscales");   // [num_groups, OC] BF16
-            Tensor wz_tensor = loader.load_tensor(key_prefix + ".wzeros");    // [num_groups, OC] BF16
-            Tensor bias_raw = loader.load_tensor(key_prefix + ".bias");       // [OC] BF16
+            out_weight.mode = QuantMode::INT4_AWQ;
 
-            int OC = (int)(qw_tensor.shape[0] * 4);  // 4608 * 4 = 18432
-            int IC = (int)(qw_tensor.shape[1] * 2);   // 1536 * 2 = 3072
-            int num_groups = (int)ws_tensor.shape[0];  // 48
-            int group_size = IC / num_groups;           // 64
-            int num_components = 6;                     // modulation: shift1,scale1,gate1,shift2,scale2,gate2
-            int dim = OC / num_components;              // 3072
+            // Load original AWQ packed qweight [OC/4, IC/2] INT32
+            Tensor qweight_awq = loader.load_tensor(key_prefix + ".qweight");
+            out_weight.awq_wscales = loader.load_tensor(key_prefix + ".wscales");  // [num_groups, OC] BF16
+            out_weight.awq_wzeros  = loader.load_tensor(key_prefix + ".wzeros");   // [num_groups, OC] BF16
+            Tensor bias_raw = loader.load_tensor(key_prefix + ".bias");            // [OC] BF16
 
-            // Allocate output BF16 weight [OC, IC] and dequantize with de-interleaving
-            out_weight.mode = QuantMode::BF16;
-            out_weight.data = Tensor::alloc({(int64_t)OC, (int64_t)IC}, DType::BF16);
-            dequantize_awq_to_bf16((const int32_t*)qw_tensor.data,
-                                     (const __nv_bfloat16*)ws_tensor.data,
-                                     (const __nv_bfloat16*)wz_tensor.data,
-                                     (__nv_bfloat16*)out_weight.data.data,
-                                     OC, IC, group_size, num_components);
+            int OC = (int)(qweight_awq.shape[0] * 4);              // 4608 * 4 = 18432
+            int IC = (int)(qweight_awq.shape[1] * 2);              // 1536 * 2 = 3072
+            int num_groups = (int)out_weight.awq_wscales.shape[0];  // 48
+            int group_size = IC / num_groups;                        // 64
+            int num_components = 6;
+            int dim = OC / num_components;                           // 3072
+
+            out_weight.awq_OC = OC;
+            out_weight.awq_IC = IC;
+            out_weight.awq_group_size = group_size;
+            out_weight.awq_num_components = num_components;
+
+            // Repack qweight: AWQ [OC/4, IC/2] INT32 → transposed [IC/8, OC] INT32
+            // Same memory footprint, but enables perfectly coalesced reads in GEMV
+            int num_ic_groups = IC / 8;  // 384
+            out_weight.awq_qweight = Tensor::alloc({(int64_t)num_ic_groups, (int64_t)OC}, DType::INT32);
+            repack_awq_to_transposed((const int32_t*)qweight_awq.data,
+                                     (int32_t*)out_weight.awq_qweight.data, OC, IC);
             CUDA_CHECK(cudaDeviceSynchronize());
+            qweight_awq.free_data();
 
             // De-interleave bias on CPU and subtract 1 from scale components
-            // Nunchaku bias is interleaved: [feat0_comp0, feat0_comp1, ..., feat0_comp5, feat1_comp0, ...]
-            // Standard order: [shift1[0..dim-1], scale1[0..dim-1], gate1[0..dim-1], ...]
-            // Scale components are at indices [1*dim : 2*dim] (scale1) and [4*dim : 5*dim] (scale2)
             std::vector<__nv_bfloat16> bias_cpu(OC);
             CUDA_CHECK(cudaMemcpy(bias_cpu.data(), bias_raw.data, OC * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
@@ -459,10 +465,7 @@ struct TransformerWeights {
                 int feature = j / num_components;
                 int std_idx = component * dim + feature;
                 float val = __bfloat162float(bias_cpu[j]);
-                // Subtract 1 from scale components (scale1=comp1, scale2=comp4)
-                if (component == 1 || component == 4) {
-                    val -= 1.0f;
-                }
+                if (component == 1 || component == 4) val -= 1.0f;
                 bias_deinterleaved[std_idx] = __float2bfloat16(val);
             }
 
@@ -470,10 +473,6 @@ struct TransformerWeights {
             CUDA_CHECK(cudaMemcpy(out_bias.data, bias_deinterleaved.data(),
                                   OC * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
-            // Free temporary AWQ tensors
-            qw_tensor.free_data();
-            ws_tensor.free_data();
-            wz_tensor.free_data();
             bias_raw.free_data();
         };
 

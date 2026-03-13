@@ -577,7 +577,7 @@ int main(int argc, char** argv) {
         int feature_dim = 3072;  // Transformer feature dimension
         int n_img = ((latent_h + 1) / 2) * ((latent_w + 1) / 2);  // Number of image tokens after patching
         int spatial_size = n_img;  // For Spectrum, spatial dimension is number of image tokens
-        int max_buffer = 100;  // Match bundled Spectrum reference (K=100)
+        int max_buffer = (cfg.steps < 100) ? cfg.steps : 100;
         spectrum_init(spectrum_state_cond, feature_dim, spatial_size, max_buffer, cfg.spectrum_order);
         spectrum_init(spectrum_state_uncond, feature_dim, spatial_size, max_buffer, cfg.spectrum_order);
         spectrum_state_cond.current_window = (float)cfg.spectrum_window;

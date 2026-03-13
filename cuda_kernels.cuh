@@ -180,7 +180,7 @@ void linear_forward_batched(const Tensor& x, const Tensor& weight, const Tensor*
 // INT4: SVDQuant — per-group INT4 residual + BF16 low-rank correction
 // ================================================================
 
-enum class QuantMode { INT8_HADAMARD, INT4_SVD, BF16 };
+enum class QuantMode { INT8_HADAMARD, INT4_SVD, BF16, INT4_AWQ };
 
 // Quantized weight supporting both INT8 and INT4+SVD modes.
 // Unused fields stay null (no GPU memory allocated).
@@ -213,6 +213,15 @@ struct QuantizedWeight {
     // --- W4A4 MMA fragment-ordered weights for register-direct GEMM ---
     Tensor qweight_mma;         // [num_groups * N_tiles8 * 256] UINT8 — MMA-fragment-ordered packed INT4
 
+    // --- AWQ INT4 packed fields (kept packed for on-the-fly dequant GEMV) ---
+    Tensor awq_qweight;         // [OC/4, IC/2] INT32 — AWQ kInterleave=4 packed nibbles
+    Tensor awq_wscales;         // [num_groups, OC] BF16 — per-group scales
+    Tensor awq_wzeros;          // [num_groups, OC] BF16 — per-group zero points
+    int awq_OC = 0;             // output channels (e.g. 18432)
+    int awq_IC = 0;             // input channels (e.g. 3072)
+    int awq_group_size = 64;    // quantization group size
+    int awq_num_components = 6; // de-interleave factor (6 for modulation)
+
     QuantizedWeight() : had_block_size(0), group_size(128), svd_rank(0), nf4_grid(true), nunchaku_swizzle(false) {}
     QuantizedWeight(QuantizedWeight&&) = default;
     QuantizedWeight& operator=(QuantizedWeight&&) = default;
@@ -229,6 +238,9 @@ struct QuantizedWeight {
         qweight_rowmajor.free_data();
         wscales_rowmajor.free_data();
         qweight_mma.free_data();
+        awq_qweight.free_data();
+        awq_wscales.free_data();
+        awq_wzeros.free_data();
     }
 };
 
@@ -329,6 +341,17 @@ void dequantize_nunchaku_to_bf16(const uint8_t* qweight, const __nv_bfloat16* ws
 // Quantize FP32 residual → packed INT4 + per-group scales
 void quantize_int4_per_group(const float* residual, uint8_t* qweight, float* scales,
                               int N, int K, int group_size, cudaStream_t stream = 0);
+
+// AWQ INT4 fused GEMV: M=1 vector-matrix multiply with on-the-fly dequantization
+// input: [1, IC] FP32, output: [1, OC] FP32, weight kept in packed INT4 AWQ format
+void linear_forward_awq(const Tensor& x, const QuantizedWeight& weight,
+                         const Tensor* bias, Tensor& out);
+
+// Repack AWQ kInterleave=4 packed qweight [OC/4, IC/2] INT32 to simple transposed
+// format [IC/8, OC] INT32 where each INT32 holds 8 consecutive INT4 nibbles.
+// This enables perfectly coalesced reads in the GEMV kernel.
+void repack_awq_to_transposed(const int32_t* qweight_awq, int32_t* qweight_out,
+                               int OC, int IC, cudaStream_t stream = 0);
 
 // Dequantize nunchaku AWQ INT4 modulation weights to BF16 with output de-interleaving
 // qweight: [OC/4, IC/2] INT32 (kInterleave=4), wscales/wzeros: [IC/group_size, OC] BF16

@@ -3048,6 +3048,135 @@ void dequantize_awq_to_bf16(const int32_t* qweight, const __nv_bfloat16* wscales
         qweight, wscales, wzeros, out, OC, IC, group_size, num_components);
 }
 
+// ==================== AWQ INT4 Repack + Fused GEMV ====================
+//
+// Strategy: Repack AWQ kInterleave=4 weights at load time into a simple transposed
+// format [IC/8, OC] INT32 where each INT32 holds 8 consecutive INT4 nibbles for one
+// (nk_oc, ic_group) pair. This enables perfectly coalesced reads in the GEMV kernel:
+// adjacent threads read adjacent INT32 words (adjacent OC for same IC group).
+
+// --- Repack kernel: AWQ [OC/4, IC/2] INT32 → [IC/8, OC] INT32 ---
+__global__ void repack_awq_kernel(
+    const int32_t* __restrict__ qweight_awq,  // [OC/4, IC/2] INT32
+    int32_t* __restrict__ qweight_out,         // [IC/8, OC] INT32
+    int OC, int IC)
+{
+    // Each thread repacks one (nk_oc, ic_group) pair
+    int nk_oc = blockIdx.x * blockDim.x + threadIdx.x;
+    int ic_group = blockIdx.y;
+    if (nk_oc >= OC) return;
+
+    int qw_row = nk_oc / 4;
+    int p = nk_oc % 4;
+    int half_IC = IC / 2;
+
+    int32_t packed = 0;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        int ic = ic_group * 8 + k;
+        // AWQ kInterleave=4 address formula
+        int ic_div64  = ic >> 6;
+        int ic_mod8   = ic & 7;
+        int ic_hi     = ((ic & 63) >> 5) << 3;
+        int ic_nibble = ((ic >> 3) & 3) << 2;
+        int i16 = (ic_div64 << 6) + p * 16 + ic_hi + ic_mod8;
+        int qw_col = i16 >> 1;
+        int bit_offset = ((i16 & 1) << 4) + ic_nibble;
+
+        int q = (qweight_awq[qw_row * half_IC + qw_col] >> bit_offset) & 0xF;
+        packed |= (q << (k * 4));
+    }
+
+    qweight_out[ic_group * OC + nk_oc] = packed;
+}
+
+void repack_awq_to_transposed(const int32_t* qweight_awq, int32_t* qweight_out,
+                               int OC, int IC, cudaStream_t stream) {
+    int num_ic_groups = IC / 8;  // 3072/8 = 384
+    dim3 block(256);
+    dim3 grid((OC + 255) / 256, num_ic_groups);
+    repack_awq_kernel<<<grid, block, 0, stream>>>(qweight_awq, qweight_out, OC, IC);
+}
+
+// --- GEMV kernel for repacked [IC/8, OC] INT32 format ---
+// One thread per output channel. Input preloaded to shared memory (12 KB).
+// All qweight/scale/zero reads are perfectly coalesced (adjacent threads = adjacent OC).
+static constexpr int AWQ_GEMV_BLOCK = 256;
+
+__global__ void awq_gemv_repacked_kernel(
+    const float* __restrict__ input,           // [IC] FP32
+    const int32_t* __restrict__ qweight,       // [IC/8, OC] INT32 repacked
+    const __nv_bfloat16* __restrict__ wscales, // [num_groups, OC] BF16
+    const __nv_bfloat16* __restrict__ wzeros,  // [num_groups, OC] BF16
+    const __nv_bfloat16* __restrict__ bias,    // [OC] BF16 (de-interleaved, std order)
+    float* __restrict__ output,                // [OC] FP32
+    int OC, int IC, int group_size, int num_components)
+{
+    // Preload all input to shared memory (12 KB for IC=3072)
+    extern __shared__ float s_input[];
+    for (int i = threadIdx.x; i < IC; i += AWQ_GEMV_BLOCK)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    int nk_oc = blockIdx.x * AWQ_GEMV_BLOCK + threadIdx.x;
+    if (nk_oc >= OC) return;
+
+    int dim = OC / num_components;
+    int num_groups = IC / group_size;
+    int gs8 = group_size / 8;  // IC groups per quantization group: 64/8 = 8
+
+    float acc = 0.f;
+
+    for (int g = 0; g < num_groups; g++) {
+        float scale = __bfloat162float(wscales[g * OC + nk_oc]);
+        float zero  = __bfloat162float(wzeros[g * OC + nk_oc]);
+
+        int ig_start = g * gs8;
+        #pragma unroll
+        for (int ig_off = 0; ig_off < 8; ig_off++) {
+            int ig = ig_start + ig_off;
+            int32_t packed = qweight[ig * OC + nk_oc];
+            int ic_base = ig * 8;
+
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int q = (packed >> (k * 4)) & 0xF;
+                acc += ((float)q * scale + zero) * s_input[ic_base + k];
+            }
+        }
+    }
+
+    // De-interleave nk_oc → std_oc and write output
+    int std_oc = (nk_oc % num_components) * dim + (nk_oc / num_components);
+    if (bias) acc += __bfloat162float(bias[std_oc]);
+    output[std_oc] = acc;
+}
+
+void linear_forward_awq(const Tensor& x, const QuantizedWeight& weight,
+                          const Tensor* bias, Tensor& out) {
+    assert(x.dtype == DType::FP32);
+    assert(out.dtype == DType::FP32);
+    assert(weight.mode == QuantMode::INT4_AWQ);
+
+    int M = (int)x.shape[0];
+    assert(M == 1 && "AWQ GEMV only supports M=1");
+
+    int OC = weight.awq_OC;
+    int IC = weight.awq_IC;
+
+    int grid = (OC + AWQ_GEMV_BLOCK - 1) / AWQ_GEMV_BLOCK;
+    int smem_bytes = IC * sizeof(float);  // 12 KB for IC=3072
+
+    awq_gemv_repacked_kernel<<<grid, AWQ_GEMV_BLOCK, smem_bytes>>>(
+        (const float*)x.data,
+        (const int32_t*)weight.awq_qweight.data,
+        (const __nv_bfloat16*)weight.awq_wscales.data,
+        (const __nv_bfloat16*)weight.awq_wzeros.data,
+        bias ? (const __nv_bfloat16*)bias->data : nullptr,
+        (float*)out.data,
+        OC, IC, weight.awq_group_size, weight.awq_num_components);
+}
+
 // Dequantize packed INT4 [N, K/2] + per-group scales [N, K/gs] -> FP32 [N, K]
 __global__ void dequantize_int4_to_fp32_kernel(
     const uint8_t* __restrict__ qweight,
@@ -4208,11 +4337,10 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     assert(weight.mode == QuantMode::INT4_SVD);
 
     int M = (int)x.shape[0];
-    // Use rowmajor tensors for dimensions when swizzled originals are freed
-    const Tensor& qw_ref = weight.qweight_rowmajor.data ? weight.qweight_rowmajor : weight.qweight;
-    int N = (int)qw_ref.shape[0];
-    int K = (int)(qw_ref.shape[1] * 2);
     int r = weight.svd_rank;
+    // Derive N from svd_up [N, r] and K from svd_down [K, r] (always present for INT4_SVD)
+    int N = (int)weight.svd_up.shape[0];
+    int K = (int)weight.svd_down.shape[0];
 
     // Scratch layout (256-byte aligned regions):
     //   [A] BF16 dequantized weight [N, K]  (Hadamard-rotated residual)
@@ -4231,7 +4359,7 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
 
     bool has_smooth = (weight.smooth.data != nullptr);
-    bool use_w4a4 = weight.nunchaku_swizzle && weight.qweight_rowmajor.data && !getenv("FORCE_W4A16");
+    bool use_w4a4 = weight.nunchaku_swizzle && weight.qweight_mma.data && !getenv("FORCE_W4A16");
 
     // Internal profiling (activated with PROFILE_LINEAR env var)
     static bool profile_linear = (getenv("PROFILE_LINEAR") != nullptr);
@@ -4304,10 +4432,10 @@ void linear_forward_int4(const Tensor& x, const QuantizedWeight& weight,
     if (use_w4a4) {
         // W4A4 GEMM with accumulate=true: adds result directly to out (which has LoRA output)
         // Also fuses bias add into the output write
-        w4a4_gemm(act_packed, (uint8_t*)weight.qweight_rowmajor.data,
+        w4a4_gemm(act_packed, nullptr,
                   act_scales_ptr, (float*)weight.wscales_rowmajor.data,
                   (float*)out.data, M, N, K, weight.group_size,
-                  weight.qweight_mma.data ? (const uint32_t*)weight.qweight_mma.data : nullptr,
+                  (const uint32_t*)weight.qweight_mma.data,
                   true, bias_ptr);  // accumulate into LoRA output + fused bias
         PL_END(prof_w4a4);
     } else if (weight.nunchaku_swizzle && weight.qweight_rowmajor.data) {
@@ -4471,7 +4599,9 @@ static void linear_forward_bf16_bf16in(const Tensor& x, const QuantizedWeight& w
 void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
                                const Tensor* bias, Tensor& out, Tensor& scratch,
                                bool apply_gelu) {
-    if (weight.mode == QuantMode::BF16) {
+    if (weight.mode == QuantMode::INT4_AWQ) {
+        linear_forward_awq(x, weight, bias, out);
+    } else if (weight.mode == QuantMode::BF16) {
         linear_forward_bf16(x, weight, bias, out, scratch, apply_gelu);
     } else if (weight.mode == QuantMode::INT4_SVD) {
         linear_forward_int4(x, weight, bias, out, scratch, apply_gelu);
@@ -4482,7 +4612,15 @@ void linear_forward_quantized(const Tensor& x, const QuantizedWeight& weight,
 
 void linear_forward_quantized_bf16in(const Tensor& x, const QuantizedWeight& weight,
                                       const Tensor* bias, Tensor& out, Tensor& scratch) {
-    if (weight.mode == QuantMode::BF16) {
+    if (weight.mode == QuantMode::INT4_AWQ) {
+        // AWQ GEMV expects FP32 input; convert BF16 → FP32
+        int M = (int)x.shape[0];
+        int K = (int)x.shape[1];
+        Tensor fp32_x = Tensor::alloc({(int64_t)M, (int64_t)K}, DType::FP32);
+        bf16_to_fp32((__nv_bfloat16*)x.data, (float*)fp32_x.data, (int64_t)M * K);
+        linear_forward_awq(fp32_x, weight, bias, out);
+        fp32_x.free_data();
+    } else if (weight.mode == QuantMode::BF16) {
         linear_forward_bf16_bf16in(x, weight, bias, out);
     } else if (weight.mode == QuantMode::INT4_SVD) {
         int M = (int)x.shape[0];
